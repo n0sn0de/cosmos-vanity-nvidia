@@ -251,19 +251,25 @@ impl VanitySearcher {
         Ok(rx)
     }
 
-    /// Run the search using GPU acceleration with CPU key generation.
+    /// Run the search using GPU acceleration with multi-threaded CPU key generation.
     ///
-    /// CPU generates keys in batches, GPU computes SHA256→RIPEMD160 hashes,
-    /// CPU checks bech32 pattern matches and verifies.
+    /// **Hybrid architecture:**
+    /// - N-1 CPU threads run full independent search (keygen + hash + match) — same as `search_cpu()`
+    /// - N CPU keygen threads feed pubkeys into a shared channel
+    /// - 1 GPU driver thread pulls batches from the channel, ships to GPU for hashing,
+    ///   then does bech32 encode + pattern match on CPU
+    ///
+    /// This ensures we never lose CPU throughput — the GPU path is purely additive.
     #[cfg(feature = "opencl")]
     pub fn search_gpu(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
         use crate::opencl::GpuContext;
 
         let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
-        let batch_size = gpu_ctx.suggested_batch_size();
+        // Use larger batches to amortize kernel launch overhead
+        let batch_size = (gpu_ctx.suggested_batch_size()).max(32_768);
 
         tracing::info!(
-            "Starting GPU-accelerated search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            "Starting hybrid GPU+CPU search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
             gpu_ctx.device_name(),
             batch_size,
             gpu_ctx.max_compute_units(),
@@ -274,7 +280,7 @@ impl VanitySearcher {
         // Validate pattern charset early
         self.config.pattern.validate_bech32_charset()?;
 
-        let (tx, rx) = bounded::<SearchResult>(32);
+        let (result_tx, result_rx) = bounded::<SearchResult>(32);
         let start = Instant::now();
         let pattern = self.config.pattern.clone();
         let hrp = self.config.hrp.clone();
@@ -283,35 +289,196 @@ impl VanitySearcher {
         let counter = Arc::clone(&self.candidates_checked);
         let stop_flag = Arc::clone(&self.should_stop);
 
-        std::thread::Builder::new()
-            .name("gpu-search-driver".to_string())
-            .spawn(move || {
-                let mut matches_found: u64 = 0;
+        let num_cpu_threads = self.config.num_threads;
+        let matches_found = Arc::new(AtomicU64::new(self.state.matches_found));
 
-                loop {
-                    if stop_flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if max_matches > 0 && matches_found >= max_matches as u64 {
-                        break;
-                    }
+        // --- Phase 1: Spawn N-1 CPU worker threads doing full independent search ---
+        // These are identical to search_cpu() workers — they never lose throughput
+        let cpu_search_threads = if num_cpu_threads > 1 { num_cpu_threads - 1 } else { 0 };
 
-                    // Generate batch of keys on CPU
-                    let mut pubkeys_flat = Vec::with_capacity(batch_size * 33);
-                    let mut mnemonics = Vec::with_capacity(batch_size);
-                    let mut paths = Vec::with_capacity(batch_size);
+        tracing::info!(
+            "Hybrid mode: {} CPU search threads + {} GPU keygen threads + 1 GPU driver",
+            cpu_search_threads,
+            num_cpu_threads,
+        );
 
-                    for _ in 0..batch_size {
-                        match generate_random_keypair_with_path(&path) {
-                            Ok(key) => {
-                                pubkeys_flat.extend_from_slice(key.public_key_bytes());
-                                mnemonics.push(key.mnemonic().to_string());
-                                paths.push(key.derivation_path().to_string());
-                            }
+        for thread_id in 0..cpu_search_threads {
+            let tx = result_tx.clone();
+            let pattern = pattern.clone();
+            let hrp = hrp.clone();
+            let path = path.clone();
+            let counter = Arc::clone(&counter);
+            let stop_flag = Arc::clone(&stop_flag);
+            let matches_found = Arc::clone(&matches_found);
+
+            std::thread::Builder::new()
+                .name(format!("cpu-search-{thread_id}"))
+                .spawn(move || {
+                    tracing::debug!("CPU search worker {thread_id} started");
+
+                    loop {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if max_matches > 0
+                            && matches_found.load(Ordering::Relaxed) >= max_matches as u64
+                        {
+                            break;
+                        }
+
+                        let key = match generate_random_keypair_with_path(&path) {
+                            Ok(k) => k,
                             Err(e) => {
                                 tracing::error!("Key generation error: {e}");
                                 continue;
                             }
+                        };
+
+                        let candidate_num = counter.fetch_add(1, Ordering::Relaxed);
+
+                        let address = match pubkey_to_bech32(key.public_key_bytes(), &hrp) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::error!("Address generation error: {e}");
+                                continue;
+                            }
+                        };
+
+                        if pattern.matches(&address, &hrp) {
+                            let elapsed = start.elapsed().as_secs_f64();
+                            tracing::info!(
+                                "🎯 CPU Match found! Address: {} (candidate #{})",
+                                address,
+                                candidate_num
+                            );
+
+                            matches_found.fetch_add(1, Ordering::Relaxed);
+
+                            let result = SearchResult {
+                                address,
+                                mnemonic: key.mnemonic().to_string(),
+                                derivation_path: key.derivation_path().to_string(),
+                                candidate_number: candidate_num,
+                                elapsed_secs: elapsed,
+                            };
+
+                            if tx.send(result).is_err() {
+                                break;
+                            }
+                        }
+
+                        drop(key);
+                    }
+
+                    tracing::debug!("CPU search worker {thread_id} exited");
+                })?;
+        }
+
+        // --- Phase 2: GPU pipeline ---
+        // N keygen threads → channel → GPU driver thread
+
+        // Channel for keygen threads to send pubkey data to GPU driver
+        // Buffer enough for ~2 batches worth to keep GPU fed
+        let (keygen_tx, keygen_rx) = bounded::<(Vec<u8>, String, String)>(batch_size * 2);
+
+        // Spawn N keygen feeder threads
+        for thread_id in 0..num_cpu_threads {
+            let keygen_tx = keygen_tx.clone();
+            let path = path.clone();
+            let stop_flag = Arc::clone(&stop_flag);
+            let matches_found = Arc::clone(&matches_found);
+
+            std::thread::Builder::new()
+                .name(format!("gpu-keygen-{thread_id}"))
+                .spawn(move || {
+                    tracing::debug!("GPU keygen worker {thread_id} started");
+
+                    loop {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if max_matches > 0
+                            && matches_found.load(Ordering::Relaxed) >= max_matches as u64
+                        {
+                            break;
+                        }
+
+                        let key = match generate_random_keypair_with_path(&path) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                tracing::error!("Keygen error: {e}");
+                                continue;
+                            }
+                        };
+
+                        let pubkey = key.public_key_bytes().to_vec();
+                        let mnemonic = key.mnemonic().to_string();
+                        let deriv_path = key.derivation_path().to_string();
+                        drop(key);
+
+                        if keygen_tx.send((pubkey, mnemonic, deriv_path)).is_err() {
+                            break; // Channel closed
+                        }
+                    }
+
+                    tracing::debug!("GPU keygen worker {thread_id} exited");
+                })?;
+        }
+
+        // Drop our copy so channel closes when all keygen threads finish
+        drop(keygen_tx);
+
+        // GPU driver thread: pulls batches from channel, ships to GPU, checks matches
+        let gpu_result_tx = result_tx.clone();
+        let gpu_counter = Arc::clone(&counter);
+        let gpu_stop = Arc::clone(&stop_flag);
+        let gpu_matches = Arc::clone(&matches_found);
+        let gpu_pattern = pattern.clone();
+        let gpu_hrp = hrp.clone();
+
+        std::thread::Builder::new()
+            .name("gpu-driver".to_string())
+            .spawn(move || {
+                tracing::debug!("GPU driver thread started");
+
+                let mut pubkeys_flat = Vec::with_capacity(batch_size * 33);
+                let mut mnemonics = Vec::with_capacity(batch_size);
+                let mut paths = Vec::with_capacity(batch_size);
+
+                loop {
+                    if gpu_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if max_matches > 0
+                        && gpu_matches.load(Ordering::Relaxed) >= max_matches as u64
+                    {
+                        break;
+                    }
+
+                    // Collect a batch
+                    pubkeys_flat.clear();
+                    mnemonics.clear();
+                    paths.clear();
+
+                    // Block on first item to avoid busy-spinning
+                    match keygen_rx.recv() {
+                        Ok((pubkey, mnemonic, deriv_path)) => {
+                            pubkeys_flat.extend_from_slice(&pubkey);
+                            mnemonics.push(mnemonic);
+                            paths.push(deriv_path);
+                        }
+                        Err(_) => break, // Channel closed
+                    }
+
+                    // Drain remaining up to batch_size
+                    while mnemonics.len() < batch_size {
+                        match keygen_rx.try_recv() {
+                            Ok((pubkey, mnemonic, deriv_path)) => {
+                                pubkeys_flat.extend_from_slice(&pubkey);
+                                mnemonics.push(mnemonic);
+                                paths.push(deriv_path);
+                            }
+                            Err(_) => break, // Empty or closed
                         }
                     }
 
@@ -320,7 +487,7 @@ impl VanitySearcher {
                         continue;
                     }
 
-                    // Send pubkeys to GPU for hashing
+                    // Ship to GPU
                     let hashes = match gpu_ctx.hash_pubkeys_batch(&pubkeys_flat) {
                         Ok(h) => h,
                         Err(e) => {
@@ -329,20 +496,21 @@ impl VanitySearcher {
                         }
                     };
 
-                    let batch_start = counter.fetch_add(actual_batch as u64, Ordering::Relaxed);
+                    let batch_start =
+                        gpu_counter.fetch_add(actual_batch as u64, Ordering::Relaxed);
 
-                    // Check each hash against the pattern (bech32 encode on CPU)
+                    // Check each hash for matches
                     for i in 0..actual_batch {
                         let hash_bytes: [u8; 20] = hashes[i * 20..(i + 1) * 20]
                             .try_into()
                             .expect("20 bytes");
 
-                        let address = match encode_bech32(&hrp, &hash_bytes) {
+                        let address = match encode_bech32(&gpu_hrp, &hash_bytes) {
                             Ok(a) => a,
                             Err(_) => continue,
                         };
 
-                        if pattern.matches(&address, &hrp) {
+                        if gpu_pattern.matches(&address, &gpu_hrp) {
                             let candidate_num = batch_start + i as u64;
                             let elapsed = start.elapsed().as_secs_f64();
                             tracing::info!(
@@ -351,7 +519,7 @@ impl VanitySearcher {
                                 candidate_num
                             );
 
-                            matches_found += 1;
+                            gpu_matches.fetch_add(1, Ordering::Relaxed);
 
                             let result = SearchResult {
                                 address,
@@ -361,15 +529,20 @@ impl VanitySearcher {
                                 elapsed_secs: elapsed,
                             };
 
-                            if tx.send(result).is_err() {
+                            if gpu_result_tx.send(result).is_err() {
                                 return;
                             }
                         }
                     }
                 }
+
+                tracing::debug!("GPU driver thread exited");
             })?;
 
-        Ok(rx)
+        // Drop our copy of result_tx so channel closes when all threads finish
+        drop(result_tx);
+
+        Ok(result_rx)
     }
 
     /// Save current state to the configured state file.

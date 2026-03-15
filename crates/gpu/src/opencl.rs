@@ -248,14 +248,18 @@ impl GpuContext {
     }
 
     /// Suggested batch size based on device capabilities.
+    ///
+    /// For the hybrid pipeline, we want large batches (32K-64K+) to
+    /// amortize GPU kernel launch overhead. The CPU keygen threads
+    /// fill the queue in parallel, so we can afford big batches.
     pub fn suggested_batch_size(&self) -> usize {
-        // Target: enough work items to saturate all CUs
+        // Target: enough work items to saturate all CUs with large batches
         // Each CU can run many wavefronts (64 threads each on AMD)
-        let waves_per_cu = 8;
+        let waves_per_cu = 16; // More waves to keep GPU busy during kernel dispatch
         let wave_size = 64; // AMD wavefront size
         let base = self.max_compute_units as usize * waves_per_cu * wave_size;
-        // Round up to nice power-of-2 aligned number, minimum 16k
-        base.max(16_384).next_power_of_two()
+        // Round up to power-of-2, minimum 32K for amortized dispatch overhead
+        base.max(32_768).next_power_of_two()
     }
 }
 
