@@ -10,5 +10,6 @@ cosmos-vanity-keyderiv = { workspace = true }
 cosmos-vanity-address = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]

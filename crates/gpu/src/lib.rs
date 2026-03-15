@@ -50,5 +50,5 @@ pub mod opencl {
     }
 }
 
-pub use search::{SearchConfig, SearchMode, SearchResult, VanitySearcher};
+pub use search::{KeyMode, SearchConfig, SearchMode, SearchResult, VanitySearcher};
 pub use state::SearchState;

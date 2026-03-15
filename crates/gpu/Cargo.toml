@@ -26,5 +26,6 @@ chrono = { workspace = true }
 num_cpus = { workspace = true }
 zeroize = { workspace = true }
 
-[dev-dependencies]
 hex = { workspace = true }
+
+[dev-dependencies]

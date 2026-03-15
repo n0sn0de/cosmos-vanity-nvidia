@@ -13,7 +13,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use cosmos_vanity_address::VanityPattern;
-use cosmos_vanity_gpu::{SearchConfig, SearchMode, VanitySearcher};
+use cosmos_vanity_gpu::{KeyMode, SearchConfig, SearchMode, VanitySearcher};
 use cosmos_vanity_verify::verify_match;
 
 /// Cosmos Vanity Address Generator — AMD GPU accelerated
@@ -60,6 +60,10 @@ enum Commands {
         /// Search mode: gpu (pure GPU, default), hybrid (CPU+GPU), cpu (CPU only)
         #[arg(short, long, default_value = "gpu")]
         mode: SearchModeArg,
+
+        /// Key mode: raw (fast, privkey only) or mnemonic (BIP-39 compatible)
+        #[arg(short = 'k', long, default_value = "raw")]
+        key_mode: KeyModeArg,
 
         /// Maximum number of matches to find
         #[arg(short = 'n', long, default_value = "1")]
@@ -153,6 +157,23 @@ impl SearchModeArg {
 }
 
 #[derive(Debug, Clone, ValueEnum)]
+enum KeyModeArg {
+    /// Raw mode: fast privkey generation, returns hex private key
+    Raw,
+    /// Mnemonic mode: BIP-39 compatible, returns 24-word mnemonic
+    Mnemonic,
+}
+
+impl KeyModeArg {
+    fn to_key_mode(&self) -> KeyMode {
+        match self {
+            KeyModeArg::Raw => KeyMode::Raw,
+            KeyModeArg::Mnemonic => KeyMode::Mnemonic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, ValueEnum)]
 enum OutputFormat {
     Text,
     Json,
@@ -178,6 +199,7 @@ fn main() -> Result<()> {
             path,
             threads,
             mode,
+            key_mode,
             max_matches,
             state_file,
             checkpoint_interval,
@@ -197,12 +219,15 @@ fn main() -> Result<()> {
             // Determine effective mode — fall back from GPU/hybrid to CPU if no OpenCL
             let effective_mode = resolve_mode(&mode);
 
+            let effective_key_mode = key_mode.to_key_mode();
+
             let config = SearchConfig {
                 pattern: vanity_pattern.clone(),
                 hrp: hrp.clone(),
                 derivation_path: path,
                 num_threads: threads.unwrap_or_else(num_cpus::get),
                 mode: effective_mode,
+                key_mode: effective_key_mode,
                 max_matches,
                 checkpoint_interval,
                 state_file,
@@ -222,6 +247,7 @@ fn main() -> Result<()> {
             println!("   HRP:      {hrp}");
             println!("   Threads:  {}", config.num_threads);
             println!("   Mode:     {mode_label}");
+            println!("   Key mode: {effective_key_mode}");
             println!("   Max hits: {max_matches}");
             println!("   Difficulty: ~{} avg candidates ({})", format_number(expected_candidates), difficulty_label);
             println!();
@@ -245,11 +271,27 @@ fn main() -> Result<()> {
                 SearchMode::Gpu => {
                     #[cfg(feature = "opencl")]
                     {
-                        match searcher.search_gpu_pure() {
-                            Ok(rx) => rx,
-                            Err(e) => {
-                                eprintln!("⚠️  GPU init failed ({e}), falling back to CPU");
-                                searcher.search_cpu()?
+                        if effective_key_mode == KeyMode::Raw {
+                            match searcher.search_gpu_raw() {
+                                Ok(rx) => rx,
+                                Err(e) => {
+                                    eprintln!("⚠️  GPU raw mode failed ({e}), falling back to mnemonic GPU mode");
+                                    match searcher.search_gpu_pure() {
+                                        Ok(rx) => rx,
+                                        Err(e2) => {
+                                            eprintln!("⚠️  GPU init failed ({e2}), falling back to CPU");
+                                            searcher.search_cpu()?
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            match searcher.search_gpu_pure() {
+                                Ok(rx) => rx,
+                                Err(e) => {
+                                    eprintln!("⚠️  GPU init failed ({e}), falling back to CPU");
+                                    searcher.search_cpu()?
+                                }
                             }
                         }
                     }
@@ -348,7 +390,43 @@ fn main() -> Result<()> {
             for result in rx.iter() {
                 found += 1;
                 pb.suspend(|| {
-                    // Verify the match
+                    if let Some(ref privkey_hex) = result.private_key_hex {
+                        // Raw key mode — verify with privkey
+                        let verified = cosmos_vanity_verify::verify_privkey_address(
+                            privkey_hex, &hrp, &result.address,
+                        ).unwrap_or(false);
+
+                        match cli.format {
+                            OutputFormat::Text => {
+                                println!();
+                                println!("🎯 Match #{found} found!");
+                                println!("   Address:     {}", result.address);
+                                println!("   Private Key: {} (KEEP SECRET!)", privkey_hex);
+                                println!("   Candidate:   #{}", result.candidate_number);
+                                println!("   Time:        {:.2}s", result.elapsed_secs);
+                                println!("   Verified:    {}", if verified { "✅" } else { "❌" });
+                                println!();
+                                println!("   ⚠️  SECURITY: Store your private key securely. Anyone with this key controls the wallet.");
+                                println!();
+                            }
+                            OutputFormat::Json => {
+                                let json = serde_json::json!({
+                                    "address": result.address,
+                                    "private_key": privkey_hex,
+                                    "candidate_number": result.candidate_number,
+                                    "elapsed_secs": result.elapsed_secs,
+                                    "verified": verified,
+                                    "key_mode": "raw",
+                                });
+                                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+                            }
+                        }
+
+                        if !verified {
+                            eprintln!("⚠️  Match FAILED verification! Private key does not produce expected address.");
+                        }
+                    } else {
+                    // Mnemonic mode — verify with mnemonic
                     match verify_match(
                         &result.mnemonic,
                         &result.derivation_path,
@@ -377,6 +455,7 @@ fn main() -> Result<()> {
                                         "candidate_number": result.candidate_number,
                                         "elapsed_secs": result.elapsed_secs,
                                         "verified": true,
+                                        "key_mode": "mnemonic",
                                     });
                                     println!("{}", serde_json::to_string_pretty(&json).unwrap());
                                 }
@@ -392,6 +471,7 @@ fn main() -> Result<()> {
                             eprintln!("❌ Verification error: {e}");
                         }
                     }
+                    } // end else (mnemonic mode)
                 });
 
                 if max_matches > 0 && found >= max_matches {

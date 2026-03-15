@@ -12,9 +12,14 @@ use tracing::{debug, info};
 const PUBKEY_SIZE: usize = 33;
 /// Size of a RIPEMD-160 hash (Cosmos address hash).
 const HASH_SIZE: usize = 20;
+/// Size of a raw private key.
+const PRIVKEY_SIZE: usize = 32;
 
 /// OpenCL kernel source (embedded at compile time).
 const KERNEL_SOURCE: &str = include_str!("kernels/vanity_search.cl");
+
+/// OpenCL kernel source for secp256k1 EC operations (embedded at compile time).
+const SECP256K1_KERNEL_SOURCE: &str = include_str!("kernels/secp256k1.cl");
 
 #[derive(Debug, Error)]
 pub enum GpuError {
@@ -40,10 +45,11 @@ pub fn is_available() -> bool {
     }
 }
 
-/// GPU context holding the OpenCL queue, compiled program, and device info.
+/// GPU context holding the OpenCL queue, compiled programs, and device info.
 pub struct GpuContext {
     queue: Queue,
     program: Program,
+    secp256k1_program: Option<Program>,
     device_name: String,
     max_work_group_size: usize,
     max_compute_units: u32,
@@ -95,11 +101,28 @@ impl GpuContext {
             .devices(device)
             .build(&context)?;
 
-        info!("OpenCL kernel compiled successfully");
+        info!("OpenCL hash kernel compiled successfully");
+
+        // Compile secp256k1 kernel
+        let secp256k1_program = match Program::builder()
+            .src(SECP256K1_KERNEL_SOURCE)
+            .devices(device)
+            .build(&context)
+        {
+            Ok(prog) => {
+                info!("OpenCL secp256k1 kernel compiled successfully");
+                Some(prog)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to compile secp256k1 kernel: {e}. Raw key mode will be unavailable.");
+                None
+            }
+        };
 
         Ok(Self {
             queue,
             program,
+            secp256k1_program,
             device_name,
             max_work_group_size,
             max_compute_units,
@@ -245,6 +268,102 @@ impl GpuContext {
         matches_buf.read(&mut matches).enq()?;
 
         Ok((hashes, matches))
+    }
+
+    /// Check if the secp256k1 kernel is available (for raw key mode).
+    pub fn has_secp256k1_kernel(&self) -> bool {
+        self.secp256k1_program.is_some()
+    }
+
+    /// Generate public keys and address hashes from raw private keys entirely on GPU.
+    ///
+    /// This is the fast path — no BIP-39/BIP-32, just privkey → pubkey → hash.
+    /// Private keys are 32 bytes each, big-endian.
+    ///
+    /// Returns `(pubkeys: N×33, hashes: N×20, matches: N×u32)`.
+    pub fn generate_and_hash_batch(
+        &self,
+        privkeys: &[u8],
+        prefix_bytes: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u32>), GpuError> {
+        let program = self.secp256k1_program.as_ref().ok_or_else(|| {
+            GpuError::Ocl(ocl::Error::from("secp256k1 kernel not compiled"))
+        })?;
+
+        let n = privkeys.len() / PRIVKEY_SIZE;
+        if n == 0 {
+            return Err(GpuError::InvalidBatchSize);
+        }
+        debug!("GPU secp256k1 batch: {} private keys", n);
+
+        // Input buffer: private keys
+        let privkey_buf = Buffer::<u8>::builder()
+            .queue(self.queue.clone())
+            .len(privkeys.len())
+            .copy_host_slice(privkeys)
+            .build()?;
+
+        // Output buffers
+        let pubkey_buf = Buffer::<u8>::builder()
+            .queue(self.queue.clone())
+            .len(n * PUBKEY_SIZE)
+            .build()?;
+
+        let hash_buf = Buffer::<u8>::builder()
+            .queue(self.queue.clone())
+            .len(n * HASH_SIZE)
+            .build()?;
+
+        let matches_buf = Buffer::<u32>::builder()
+            .queue(self.queue.clone())
+            .len(n)
+            .fill_val(0u32)
+            .build()?;
+
+        let prefix_len = prefix_bytes.len();
+        let prefix_buf = if prefix_len > 0 {
+            Buffer::<u8>::builder()
+                .queue(self.queue.clone())
+                .len(prefix_len)
+                .copy_host_slice(prefix_bytes)
+                .build()?
+        } else {
+            Buffer::<u8>::builder()
+                .queue(self.queue.clone())
+                .len(1)
+                .fill_val(0u8)
+                .build()?
+        };
+
+        let kernel = Kernel::builder()
+            .program(program)
+            .name("generate_addresses")
+            .queue(self.queue.clone())
+            .global_work_size(n)
+            .arg(&privkey_buf)
+            .arg(&pubkey_buf)
+            .arg(&hash_buf)
+            .arg(&prefix_buf)
+            .arg(prefix_len as u32)
+            .arg(&matches_buf)
+            .arg(n as u32)
+            .build()?;
+
+        unsafe { kernel.enq()?; }
+        self.queue.finish()?;
+
+        // Read results
+        let mut pubkeys = vec![0u8; n * PUBKEY_SIZE];
+        pubkey_buf.read(&mut pubkeys).enq()?;
+
+        let mut hashes = vec![0u8; n * HASH_SIZE];
+        hash_buf.read(&mut hashes).enq()?;
+
+        let mut matches = vec![0u32; n];
+        matches_buf.read(&mut matches).enq()?;
+
+        debug!("GPU secp256k1 batch complete: {} keys processed", n);
+        Ok((pubkeys, hashes, matches))
     }
 
     /// Suggested batch size for hybrid mode.
@@ -418,5 +537,146 @@ mod tests {
         );
 
         eprintln!("Derived key test passed: {cpu_addr}");
+    }
+
+    /// Test GPU secp256k1 with known test vector: private key = 1 (generator point).
+    #[test]
+    fn test_gpu_secp256k1_known_vector() {
+        if !is_available() {
+            eprintln!("No GPU available, skipping GPU secp256k1 test");
+            return;
+        }
+
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                eprintln!("Could not init GPU: {e}, skipping");
+                return;
+            }
+        };
+
+        if !ctx.has_secp256k1_kernel() {
+            eprintln!("secp256k1 kernel not compiled, skipping");
+            return;
+        }
+
+        // Private key = 1 → public key is the generator point G
+        let mut privkey = [0u8; 32];
+        privkey[31] = 1; // big-endian: 0x00...01
+
+        let (pubkeys, _hashes, _matches) = ctx
+            .generate_and_hash_batch(&privkey, &[])
+            .expect("GPU secp256k1 failed");
+
+        // Expected compressed pubkey for privkey=1 (generator point G):
+        // 0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+        let expected_hex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let expected = hex::decode(expected_hex).unwrap();
+
+        assert_eq!(
+            pubkeys.len(), 33,
+            "Expected 33-byte pubkey, got {} bytes", pubkeys.len()
+        );
+
+        assert_eq!(
+            hex::encode(&pubkeys[..33]),
+            expected_hex,
+            "GPU pubkey for privkey=1 does not match expected generator point!\n  GPU:      {}\n  Expected: {}",
+            hex::encode(&pubkeys[..33]),
+            expected_hex,
+        );
+
+        eprintln!("✅ GPU secp256k1 known vector test passed! pubkey={}", hex::encode(&pubkeys[..33]));
+    }
+
+    /// Test GPU secp256k1 matches CPU reference for multiple random keys.
+    #[test]
+    fn test_gpu_secp256k1_matches_cpu() {
+        use cosmos_vanity_keyderiv::pubkey_from_privkey;
+
+        if !is_available() {
+            eprintln!("No GPU available, skipping");
+            return;
+        }
+
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                eprintln!("Could not init GPU: {e}, skipping");
+                return;
+            }
+        };
+
+        if !ctx.has_secp256k1_kernel() {
+            eprintln!("secp256k1 kernel not compiled, skipping");
+            return;
+        }
+
+        // Test with several known private keys
+        let test_privkeys: Vec<[u8; 32]> = vec![
+            // privkey = 1
+            {
+                let mut k = [0u8; 32];
+                k[31] = 1;
+                k
+            },
+            // privkey = 2
+            {
+                let mut k = [0u8; 32];
+                k[31] = 2;
+                k
+            },
+            // privkey = 7
+            {
+                let mut k = [0u8; 32];
+                k[31] = 7;
+                k
+            },
+            // A "real-looking" privkey
+            {
+                let mut k = [0u8; 32];
+                for i in 0..32 { k[i] = (i as u8 + 1) * 7; }
+                k
+            },
+        ];
+
+        // Flatten for GPU
+        let mut flat_privkeys = Vec::with_capacity(test_privkeys.len() * 32);
+        for pk in &test_privkeys {
+            flat_privkeys.extend_from_slice(pk);
+        }
+
+        let (gpu_pubkeys, gpu_hashes, _) = ctx
+            .generate_and_hash_batch(&flat_privkeys, &[])
+            .expect("GPU secp256k1 batch failed");
+
+        // Compare each
+        for (i, privkey) in test_privkeys.iter().enumerate() {
+            let cpu_pubkey = pubkey_from_privkey(privkey)
+                .expect("CPU pubkey derivation failed");
+
+            let gpu_pubkey = &gpu_pubkeys[i * 33..(i + 1) * 33];
+
+            assert_eq!(
+                cpu_pubkey.as_slice(), gpu_pubkey,
+                "Pubkey mismatch for test vector {i}!\n  privkey: {}\n  CPU: {}\n  GPU: {}",
+                hex::encode(privkey),
+                hex::encode(cpu_pubkey),
+                hex::encode(gpu_pubkey),
+            );
+
+            // Also verify hash matches
+            let cpu_hash = cosmos_vanity_address::pubkey_to_address_bytes(&cpu_pubkey).unwrap();
+            let gpu_hash = &gpu_hashes[i * 20..(i + 1) * 20];
+
+            assert_eq!(
+                cpu_hash.as_slice(), gpu_hash,
+                "Hash mismatch for test vector {i}!\n  CPU: {}\n  GPU: {}",
+                hex::encode(cpu_hash),
+                hex::encode(gpu_hash),
+            );
+        }
+
+        eprintln!("✅ All {} GPU secp256k1 test vectors matched CPU!", test_privkeys.len());
     }
 }

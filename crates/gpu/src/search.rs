@@ -13,6 +13,32 @@ use cosmos_vanity_keyderiv::generate_random_keypair_with_path;
 
 use crate::state::SearchState;
 
+/// Key generation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyMode {
+    /// Raw mode: random 32-byte private key → GPU secp256k1 → GPU hash.
+    /// Maximum speed, returns hex private key instead of mnemonic.
+    Raw,
+    /// Mnemonic mode: BIP-39 mnemonic → CPU derivation → GPU hash.
+    /// Compatible with standard wallets, returns 24-word mnemonic.
+    Mnemonic,
+}
+
+impl Default for KeyMode {
+    fn default() -> Self {
+        KeyMode::Raw
+    }
+}
+
+impl std::fmt::Display for KeyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyMode::Raw => write!(f, "raw"),
+            KeyMode::Mnemonic => write!(f, "mnemonic"),
+        }
+    }
+}
+
 /// Search mode for vanity address generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -56,6 +82,9 @@ pub struct SearchConfig {
     /// Search mode
     pub mode: SearchMode,
 
+    /// Key generation mode
+    pub key_mode: KeyMode,
+
     /// Maximum number of matches to find (0 = unlimited)
     pub max_matches: usize,
 
@@ -74,6 +103,7 @@ impl Default for SearchConfig {
             derivation_path: cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH.to_string(),
             num_threads: num_cpus::get(),
             mode: SearchMode::Cpu,
+            key_mode: KeyMode::default(),
             max_matches: 1,
             checkpoint_interval: 100_000,
             state_file: None,
@@ -87,7 +117,7 @@ pub struct SearchResult {
     /// The matching Bech32 address
     pub address: String,
 
-    /// The mnemonic that produces this address
+    /// The mnemonic that produces this address (empty in raw mode)
     pub mnemonic: String,
 
     /// The derivation path used
@@ -98,6 +128,9 @@ pub struct SearchResult {
 
     /// Time taken to find this match
     pub elapsed_secs: f64,
+
+    /// Raw private key hex (only set in raw key mode)
+    pub private_key_hex: Option<String>,
 }
 
 /// The main vanity address searcher.
@@ -257,6 +290,7 @@ impl VanitySearcher {
                                 derivation_path: key.derivation_path().to_string(),
                                 candidate_number: candidate_num,
                                 elapsed_secs: elapsed,
+                                private_key_hex: None,
                             };
 
                             if tx.send(result).is_err() {
@@ -386,6 +420,7 @@ impl VanitySearcher {
                                 derivation_path: key.derivation_path().to_string(),
                                 candidate_number: candidate_num,
                                 elapsed_secs: elapsed,
+                                private_key_hex: None,
                             };
 
                             if tx.send(result).is_err() {
@@ -543,6 +578,7 @@ impl VanitySearcher {
                                 derivation_path: paths[i].clone(),
                                 candidate_number: candidate_num,
                                 elapsed_secs: elapsed,
+                                private_key_hex: None,
                             };
 
                             if gpu_result_tx.send(result).is_err() {
@@ -778,6 +814,7 @@ impl VanitySearcher {
                                 derivation_path: buf_a_paths[i].clone(),
                                 candidate_number: candidate_num,
                                 elapsed_secs: elapsed,
+                                private_key_hex: None,
                             };
 
                             if gpu_result_tx.send(result).is_err() {
@@ -804,6 +841,141 @@ impl VanitySearcher {
 
         drop(result_tx);
 
+        Ok(result_rx)
+    }
+
+    /// Pure GPU search with raw private keys — maximum performance.
+    ///
+    /// **Architecture:**
+    /// - CPU threads generate random 32-byte private keys (fast, just OsRng)
+    /// - GPU does secp256k1 scalar multiplication + SHA-256 + RIPEMD-160
+    /// - On match, returns hex private key
+    /// - No BIP-39/BIP-32 overhead
+    #[cfg(feature = "opencl")]
+    pub fn search_gpu_raw(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
+        use crate::opencl::GpuContext;
+        use rand::RngCore;
+
+        let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
+
+        if !gpu_ctx.has_secp256k1_kernel() {
+            return Err(anyhow::anyhow!("secp256k1 GPU kernel not available"));
+        }
+
+        let batch_size = gpu_ctx.pure_gpu_batch_size();
+
+        tracing::info!(
+            "Starting RAW GPU search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            gpu_ctx.device_name(),
+            batch_size,
+            gpu_ctx.max_compute_units(),
+            self.config.pattern,
+            self.config.hrp,
+        );
+
+        self.config.pattern.validate_bech32_charset()?;
+
+        let (result_tx, result_rx) = bounded::<SearchResult>(32);
+        let start = Instant::now();
+        let pattern = self.config.pattern.clone();
+        let hrp = self.config.hrp.clone();
+        let max_matches = self.config.max_matches;
+        let counter = Arc::clone(&self.candidates_checked);
+        let stop_flag = Arc::clone(&self.should_stop);
+        let matches_found = Arc::new(AtomicU64::new(self.state.matches_found));
+
+        tracing::info!(
+            "Raw GPU mode: generating random privkeys → GPU secp256k1 + hash, batch size {}",
+            batch_size,
+        );
+
+        // GPU driver thread — generates privkeys and dispatches to GPU
+        let gpu_result_tx = result_tx.clone();
+        let gpu_counter = Arc::clone(&counter);
+        let gpu_stop = Arc::clone(&stop_flag);
+        let gpu_matches = Arc::clone(&matches_found);
+        let gpu_pattern = pattern.clone();
+        let gpu_hrp = hrp.clone();
+
+        std::thread::Builder::new()
+            .name("gpu-raw-driver".to_string())
+            .spawn(move || {
+                tracing::debug!("Raw GPU driver thread started");
+                let mut rng = rand::rngs::OsRng;
+
+                loop {
+                    if gpu_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if max_matches > 0
+                        && gpu_matches.load(Ordering::Relaxed) >= max_matches as u64
+                    {
+                        break;
+                    }
+
+                    // Generate batch of random private keys
+                    let mut privkeys = vec![0u8; batch_size * 32];
+                    rng.fill_bytes(&mut privkeys);
+
+                    // Dispatch to GPU
+                    let (_pubkeys, hashes, _matches) =
+                        match gpu_ctx.generate_and_hash_batch(&privkeys, &[]) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::error!("GPU secp256k1 error: {e}");
+                                continue;
+                            }
+                        };
+
+                    let batch_start =
+                        gpu_counter.fetch_add(batch_size as u64, Ordering::Relaxed);
+
+                    // Pattern match on CPU (bech32 encode + check)
+                    for i in 0..batch_size {
+                        let hash_bytes: [u8; 20] = hashes[i * 20..(i + 1) * 20]
+                            .try_into()
+                            .expect("20 bytes");
+
+                        let address = match cosmos_vanity_address::encode_bech32(&gpu_hrp, &hash_bytes) {
+                            Ok(a) => a,
+                            Err(_) => continue,
+                        };
+
+                        if gpu_pattern.matches(&address, &gpu_hrp) {
+                            let candidate_num = batch_start + i as u64;
+                            let elapsed = start.elapsed().as_secs_f64();
+
+                            // Extract the private key hex
+                            let privkey_hex = format!("0x{}", hex::encode(&privkeys[i * 32..(i + 1) * 32]));
+
+                            tracing::info!(
+                                "🎯 GPU Raw Match! Address: {} (candidate #{})",
+                                address,
+                                candidate_num
+                            );
+
+                            gpu_matches.fetch_add(1, Ordering::Relaxed);
+
+                            let result = SearchResult {
+                                address,
+                                mnemonic: String::new(),
+                                derivation_path: String::new(),
+                                candidate_number: candidate_num,
+                                elapsed_secs: elapsed,
+                                private_key_hex: Some(privkey_hex),
+                            };
+
+                            if gpu_result_tx.send(result).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                tracing::debug!("Raw GPU driver thread exited");
+            })?;
+
+        drop(result_tx);
         Ok(result_rx)
     }
 
@@ -897,6 +1069,7 @@ mod tests {
             derivation_path: cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH.to_string(),
             num_threads: 2,
             mode: SearchMode::Cpu,
+            key_mode: KeyMode::Mnemonic,
             max_matches: 1,
             checkpoint_interval: 1000,
             state_file: None,

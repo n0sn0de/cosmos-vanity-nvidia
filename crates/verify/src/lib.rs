@@ -108,6 +108,28 @@ pub fn verify_match(
     })
 }
 
+/// Verify that a raw private key (hex) produces the expected address.
+///
+/// Used in raw key mode where we don't have a mnemonic.
+pub fn verify_privkey_address(
+    privkey_hex: &str,
+    hrp: &str,
+    expected_address: &str,
+) -> Result<bool, VerifyError> {
+    let hex_str = privkey_hex.strip_prefix("0x").unwrap_or(privkey_hex);
+    let privkey_bytes = hex::decode(hex_str)
+        .map_err(|e| VerifyError::KeyDerivation(cosmos_vanity_keyderiv::KeyDerivError::Bip39(format!("Invalid hex: {e}"))))?;
+    if privkey_bytes.len() != 32 {
+        return Err(VerifyError::KeyDerivation(cosmos_vanity_keyderiv::KeyDerivError::Bip39(
+            format!("Private key must be 32 bytes, got {}", privkey_bytes.len())
+        )));
+    }
+    let privkey: [u8; 32] = privkey_bytes.try_into().unwrap();
+    let pubkey = cosmos_vanity_keyderiv::pubkey_from_privkey(&privkey)?;
+    let address = pubkey_to_bech32(&pubkey, hrp)?;
+    Ok(address == expected_address)
+}
+
 /// Verify just that a mnemonic produces the expected address (without pattern check).
 pub fn verify_address(
     mnemonic: &str,

@@ -93,6 +93,17 @@ impl DerivedKey {
 
 
 
+/// Derive compressed public key from raw 32-byte private key (for GPU verification).
+///
+/// This is a direct secp256k1 scalar multiplication without BIP-39/BIP-32.
+/// Used to verify GPU-computed public keys against CPU reference.
+pub fn pubkey_from_privkey(privkey: &[u8; 32]) -> Result<[u8; 33], KeyDerivError> {
+    let secp = Secp256k1::new();
+    let secret = secp256k1::SecretKey::from_slice(privkey)?;
+    let public = secret.public_key(&secp);
+    Ok(public.serialize())
+}
+
 /// Generate a random 24-word BIP-39 mnemonic and derive the keypair.
 ///
 /// Uses the default Cosmos derivation path `m/44'/118'/0'/0/0`.
