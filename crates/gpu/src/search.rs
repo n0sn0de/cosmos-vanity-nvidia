@@ -979,6 +979,180 @@ impl VanitySearcher {
         Ok(result_rx)
     }
 
+    /// Run the search using GPU-accelerated mnemonic pipeline.
+    /// CPU generates mnemonics (fast word lookup), GPU does PBKDF2 + BIP-32 + secp256k1 + hash.
+    #[cfg(feature = "opencl")]
+    pub fn search_gpu_mnemonic(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
+        use crate::opencl::GpuContext;
+        use cosmos_vanity_keyderiv::bip39::Mnemonic;
+
+        let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
+
+        if !gpu_ctx.has_mnemonic_kernel() {
+            return Err(anyhow::anyhow!("Mnemonic pipeline kernel not available"));
+        }
+
+        let batch_size = gpu_ctx.mnemonic_batch_size();
+
+        tracing::info!(
+            "Starting GPU MNEMONIC search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            gpu_ctx.device_name(),
+            batch_size,
+            gpu_ctx.max_compute_units(),
+            self.config.pattern,
+            self.config.hrp,
+        );
+        tracing::info!(
+            "GPU mnemonic mode: {} CPU threads generate mnemonics, GPU does PBKDF2+BIP32+secp256k1+hash",
+            self.config.num_threads,
+        );
+
+        self.config.pattern.validate_bech32_charset()?;
+
+        let (result_tx, result_rx) = bounded::<SearchResult>(32);
+        let start = Instant::now();
+        let pattern = self.config.pattern.clone();
+        let hrp = self.config.hrp.clone();
+        let max_matches = self.config.max_matches;
+        let counter = Arc::clone(&self.candidates_checked);
+        let stop_flag = Arc::clone(&self.should_stop);
+        let num_threads = self.config.num_threads;
+        let matches_found = Arc::new(AtomicU64::new(self.state.matches_found));
+
+        // Channel: CPU mnemonic generators → GPU driver
+        // Each item: (mnemonic_utf8_bytes, mnemonic_string)
+        let (mnem_tx, mnem_rx) = bounded::<(Vec<u8>, String)>(batch_size * 3);
+
+        // Spawn CPU threads that just generate random mnemonics (very fast — no PBKDF2)
+        for thread_id in 0..num_threads {
+            let mnem_tx = mnem_tx.clone();
+            let stop_flag = Arc::clone(&stop_flag);
+            let matches_found = Arc::clone(&matches_found);
+
+            std::thread::Builder::new()
+                .name(format!("mnem-gen-{thread_id}"))
+                .spawn(move || {
+                    loop {
+                        if stop_flag.load(Ordering::Relaxed) { break; }
+                        if max_matches > 0 && matches_found.load(Ordering::Relaxed) >= max_matches as u64 { break; }
+
+                        // Generate random mnemonic — just entropy + word lookup, NO PBKDF2
+                        let mut entropy = [0u8; 32];
+                        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy);
+                        let mnemonic: Mnemonic = match Mnemonic::from_entropy(&entropy) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        let mnemonic_str = mnemonic.to_string();
+                        let mnemonic_bytes = mnemonic_str.as_bytes().to_vec();
+
+                        if mnem_tx.send((mnemonic_bytes, mnemonic_str)).is_err() { break; }
+                    }
+                })?;
+        }
+        drop(mnem_tx);
+
+        // GPU driver: batches mnemonics, dispatches to GPU
+        std::thread::Builder::new()
+            .name("gpu-mnemonic-driver".to_string())
+            .spawn(move || {
+                let mut batch_mnemonics_flat: Vec<u8> = Vec::with_capacity(batch_size * 256);
+                let mut batch_lens: Vec<u32> = Vec::with_capacity(batch_size);
+                let mut batch_strings: Vec<String> = Vec::with_capacity(batch_size);
+
+                loop {
+                    if stop_flag.load(Ordering::Relaxed) { break; }
+                    if max_matches > 0 && matches_found.load(Ordering::Relaxed) >= max_matches as u64 { break; }
+
+                    // Fill batch
+                    batch_mnemonics_flat.clear();
+                    batch_lens.clear();
+                    batch_strings.clear();
+
+                    // Block on first item
+                    match mnem_rx.recv() {
+                        Ok((bytes, string)) => {
+                            let mut padded = vec![0u8; 256];
+                            let len = bytes.len().min(256);
+                            padded[..len].copy_from_slice(&bytes[..len]);
+                            batch_mnemonics_flat.extend_from_slice(&padded);
+                            batch_lens.push(len as u32);
+                            batch_strings.push(string);
+                        }
+                        Err(_) => break,
+                    }
+
+                    // Drain up to batch_size
+                    while batch_lens.len() < batch_size {
+                        match mnem_rx.try_recv() {
+                            Ok((bytes, string)) => {
+                                let mut padded = vec![0u8; 256];
+                                let len = bytes.len().min(256);
+                                padded[..len].copy_from_slice(&bytes[..len]);
+                                batch_mnemonics_flat.extend_from_slice(&padded);
+                                batch_lens.push(len as u32);
+                                batch_strings.push(string);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    let actual_batch = batch_lens.len();
+                    if actual_batch == 0 { continue; }
+
+                    // Dispatch to GPU
+                    let (privkeys, hashes, _matches) = match gpu_ctx.mnemonic_batch(
+                        &batch_mnemonics_flat,
+                        &batch_lens,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!("GPU mnemonic batch error: {e}");
+                            continue;
+                        }
+                    };
+
+                    let batch_start = counter.fetch_add(actual_batch as u64, Ordering::Relaxed);
+
+                    // Check each result against pattern
+                    for i in 0..actual_batch {
+                        let hash_bytes: [u8; 20] = hashes[i * 20..(i + 1) * 20]
+                            .try_into()
+                            .expect("20 bytes");
+
+                        let address = match cosmos_vanity_address::encode_bech32(&hrp, &hash_bytes) {
+                            Ok(a) => a,
+                            Err(_) => continue,
+                        };
+
+                        if pattern.matches(&address, &hrp) {
+                            let candidate_num = batch_start + i as u64;
+                            let elapsed = start.elapsed().as_secs_f64();
+                            tracing::info!(
+                                "🎯 GPU Mnemonic Match! Address: {} (candidate #{})",
+                                address, candidate_num
+                            );
+
+                            matches_found.fetch_add(1, Ordering::Relaxed);
+
+                            let result = SearchResult {
+                                address,
+                                mnemonic: batch_strings[i].clone(),
+                                derivation_path: "m/44'/118'/0'/0/0".to_string(),
+                                candidate_number: candidate_num,
+                                elapsed_secs: elapsed,
+                                private_key_hex: Some(hex::encode(&privkeys[i * 32..(i + 1) * 32])),
+                            };
+
+                            if result_tx.send(result).is_err() { return; }
+                        }
+                    }
+                }
+            })?;
+
+        Ok(result_rx)
+    }
+
     /// Save current state to the configured state file.
     pub fn save_state(&mut self) -> anyhow::Result<()> {
         if let Some(ref path) = self.config.state_file {

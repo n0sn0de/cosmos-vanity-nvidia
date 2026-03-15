@@ -286,11 +286,18 @@ fn main() -> Result<()> {
                                 }
                             }
                         } else {
-                            match searcher.search_gpu_pure() {
+                            // Try GPU mnemonic pipeline first (PBKDF2+BIP32+secp256k1 on GPU)
+                            match searcher.search_gpu_mnemonic() {
                                 Ok(rx) => rx,
                                 Err(e) => {
-                                    eprintln!("⚠️  GPU init failed ({e}), falling back to CPU");
-                                    searcher.search_cpu()?
+                                    eprintln!("⚠️  GPU mnemonic pipeline failed ({e}), falling back to CPU mnemonic GPU mode");
+                                    match searcher.search_gpu_pure() {
+                                        Ok(rx) => rx,
+                                        Err(e2) => {
+                                            eprintln!("⚠️  GPU init failed ({e2}), falling back to CPU");
+                                            searcher.search_cpu()?
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -390,7 +397,9 @@ fn main() -> Result<()> {
             for result in rx.iter() {
                 found += 1;
                 pb.suspend(|| {
-                    if let Some(ref privkey_hex) = result.private_key_hex {
+                    let empty_key = String::new();
+                    if effective_key_mode == KeyMode::Raw {
+                        let privkey_hex = result.private_key_hex.as_ref().unwrap_or(&empty_key);
                         // Raw key mode — verify with privkey
                         let verified = cosmos_vanity_verify::verify_privkey_address(
                             privkey_hex, &hrp, &result.address,
