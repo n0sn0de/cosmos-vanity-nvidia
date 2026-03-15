@@ -1,0 +1,34 @@
+[package]
+name = "cosmos-vanity-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI interface for Cosmos vanity address generation with AMD GPU acceleration"
+
+[[bin]]
+name = "cosmos-vanity"
+path = "src/main.rs"
+
+[features]
+default = []
+opencl = ["cosmos-vanity-gpu/opencl"]
+
+[dependencies]
+cosmos-vanity-keyderiv = { workspace = true }
+cosmos-vanity-address = { workspace = true }
+cosmos-vanity-gpu = { workspace = true }
+cosmos-vanity-verify = { workspace = true }
+cosmos-vanity-bench = { workspace = true }
+
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+indicatif = { workspace = true }
+num_cpus = { workspace = true }
+chrono = { workspace = true }
+ctrlc = { workspace = true }
+
+[dev-dependencies]

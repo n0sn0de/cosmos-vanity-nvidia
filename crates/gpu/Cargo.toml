@@ -1,0 +1,29 @@
+[package]
+name = "cosmos-vanity-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenCL/ROCm GPU acceleration for Cosmos vanity address generation"
+
+[features]
+default = []
+opencl = ["dep:ocl"]
+
+[dependencies]
+ocl = { workspace = true, optional = true }
+cosmos-vanity-keyderiv = { workspace = true }
+cosmos-vanity-address = { workspace = true }
+sha2 = { workspace = true }
+ripemd = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+num_cpus = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]

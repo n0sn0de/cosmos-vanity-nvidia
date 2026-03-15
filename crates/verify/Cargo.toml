@@ -1,0 +1,14 @@
+[package]
+name = "cosmos-vanity-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic CPU verification of vanity address matches"
+
+[dependencies]
+cosmos-vanity-keyderiv = { workspace = true }
+cosmos-vanity-address = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

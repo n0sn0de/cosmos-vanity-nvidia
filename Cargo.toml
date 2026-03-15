@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cli",
+    "crates/keyderiv",
+    "crates/address",
+    "crates/gpu",
+    "crates/verify",
+    "crates/bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["n0sn0de"]
+repository = "https://github.com/n0sn0de/cosmos-vanity-amd"
+
+[workspace.dependencies]
+# Internal crates
+cosmos-vanity-keyderiv = { path = "crates/keyderiv" }
+cosmos-vanity-address = { path = "crates/address" }
+cosmos-vanity-gpu = { path = "crates/gpu" }
+cosmos-vanity-verify = { path = "crates/verify" }
+cosmos-vanity-bench = { path = "crates/bench" }
+
+# Crypto
+bip39 = "2.1"
+bitcoin = { version = "0.32", features = ["rand-std"] }
+secp256k1 = { version = "0.29", features = ["rand-std"] }
+sha2 = "0.10"
+ripemd = "0.1"
+bech32 = "0.11"
+
+# GPU
+ocl = "0.19"
+
+# CLI & IO
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Security
+zeroize = { version = "1", features = ["derive"] }
+
+# Misc
+rand = "0.8"
+hex = "0.4"
+indicatif = "0.17"
+chrono = { version = "0.4", features = ["serde"] }
+num_cpus = "1"
+crossbeam-channel = "0.5"
+
+# Signal handling
+ctrlc = "3"
+regex-lite = "0.1"
+
+# Testing & Benchmarks
+criterion = { version = "0.5", features = ["html_reports"] }

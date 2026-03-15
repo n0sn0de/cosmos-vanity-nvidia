@@ -1,0 +1,22 @@
+[package]
+name = "cosmos-vanity-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Benchmarking utilities for cosmos-vanity-amd"
+
+[dependencies]
+cosmos-vanity-keyderiv = { workspace = true }
+cosmos-vanity-address = { workspace = true }
+cosmos-vanity-gpu = { workspace = true }
+cosmos-vanity-verify = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "vanity_bench"
+harness = false
