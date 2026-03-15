@@ -13,7 +13,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use cosmos_vanity_address::VanityPattern;
-use cosmos_vanity_gpu::{SearchConfig, VanitySearcher};
+use cosmos_vanity_gpu::{SearchConfig, SearchMode, VanitySearcher};
 use cosmos_vanity_verify::verify_match;
 
 /// Cosmos Vanity Address Generator — AMD GPU accelerated
@@ -57,9 +57,9 @@ enum Commands {
         #[arg(short = 'j', long)]
         threads: Option<usize>,
 
-        /// Use GPU acceleration (requires OpenCL/ROCm)
-        #[arg(long)]
-        gpu: bool,
+        /// Search mode: gpu (pure GPU, default), hybrid (CPU+GPU), cpu (CPU only)
+        #[arg(short, long, default_value = "gpu")]
+        mode: SearchModeArg,
 
         /// Maximum number of matches to find
         #[arg(short = 'n', long, default_value = "1")]
@@ -125,6 +125,34 @@ enum MatchType {
 }
 
 #[derive(Debug, Clone, ValueEnum)]
+enum SearchModeArg {
+    /// Pure GPU mode — ALL CPU threads feed keys, GPU does all hashing. Maximum performance.
+    Gpu,
+    /// Hybrid mode — CPU search threads + GPU pipeline in parallel.
+    Hybrid,
+    /// CPU-only mode — no GPU acceleration.
+    Cpu,
+}
+
+impl SearchModeArg {
+    fn to_search_mode(&self) -> SearchMode {
+        match self {
+            SearchModeArg::Gpu => SearchMode::Gpu,
+            SearchModeArg::Hybrid => SearchMode::Hybrid,
+            SearchModeArg::Cpu => SearchMode::Cpu,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            SearchModeArg::Gpu => "gpu (pure GPU)",
+            SearchModeArg::Hybrid => "hybrid (CPU+GPU)",
+            SearchModeArg::Cpu => "cpu",
+        }
+    }
+}
+
+#[derive(Debug, Clone, ValueEnum)]
 enum OutputFormat {
     Text,
     Json,
@@ -149,7 +177,7 @@ fn main() -> Result<()> {
             hrp,
             path,
             threads,
-            gpu,
+            mode,
             max_matches,
             state_file,
             checkpoint_interval,
@@ -166,22 +194,31 @@ fn main() -> Result<()> {
                 .validate_bech32_charset()
                 .context("Invalid pattern")?;
 
+            // Determine effective mode — fall back from GPU/hybrid to CPU if no OpenCL
+            let effective_mode = resolve_mode(&mode);
+
             let config = SearchConfig {
                 pattern: vanity_pattern.clone(),
                 hrp: hrp.clone(),
                 derivation_path: path,
                 num_threads: threads.unwrap_or_else(num_cpus::get),
-                use_gpu: gpu,
+                mode: effective_mode,
                 max_matches,
                 checkpoint_interval,
                 state_file,
+            };
+
+            let mode_label = match effective_mode {
+                SearchMode::Gpu => "gpu (pure GPU)",
+                SearchMode::Hybrid => "hybrid (CPU+GPU)",
+                SearchMode::Cpu => "cpu",
             };
 
             println!("🔍 Cosmos Vanity Address Search");
             println!("   Pattern:  {vanity_pattern}");
             println!("   HRP:      {hrp}");
             println!("   Threads:  {}", config.num_threads);
-            println!("   GPU:      {gpu}");
+            println!("   Mode:     {mode_label}");
             println!("   Max hits: {max_matches}");
             println!();
 
@@ -200,28 +237,43 @@ fn main() -> Result<()> {
                     .expect("template"),
             );
 
-            let rx = if gpu {
-                #[cfg(feature = "opencl")]
-                {
-                    match searcher.search_gpu() {
-                        Ok(rx) => {
-                            println!("   Engine:   GPU (OpenCL)");
-                            println!();
-                            rx
-                        }
-                        Err(e) => {
-                            eprintln!("⚠️  GPU init failed ({e}), falling back to CPU");
-                            searcher.search_cpu()?
+            let rx = match effective_mode {
+                SearchMode::Gpu => {
+                    #[cfg(feature = "opencl")]
+                    {
+                        match searcher.search_gpu_pure() {
+                            Ok(rx) => rx,
+                            Err(e) => {
+                                eprintln!("⚠️  GPU init failed ({e}), falling back to CPU");
+                                searcher.search_cpu()?
+                            }
                         }
                     }
+                    #[cfg(not(feature = "opencl"))]
+                    {
+                        // Should not reach here due to resolve_mode, but just in case
+                        searcher.search_cpu()?
+                    }
                 }
-                #[cfg(not(feature = "opencl"))]
-                {
-                    eprintln!("⚠️  OpenCL support not compiled in, falling back to CPU");
+                SearchMode::Hybrid => {
+                    #[cfg(feature = "opencl")]
+                    {
+                        match searcher.search_hybrid() {
+                            Ok(rx) => rx,
+                            Err(e) => {
+                                eprintln!("⚠️  GPU init failed ({e}), falling back to CPU");
+                                searcher.search_cpu()?
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "opencl"))]
+                    {
+                        searcher.search_cpu()?
+                    }
+                }
+                SearchMode::Cpu => {
                     searcher.search_cpu()?
                 }
-            } else {
-                searcher.search_cpu()?
             };
 
             // Progress update loop in a separate thread
@@ -367,6 +419,36 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve the requested search mode to an effective mode.
+/// Falls back from GPU/hybrid to CPU if OpenCL is not available.
+fn resolve_mode(requested: &SearchModeArg) -> SearchMode {
+    match requested {
+        SearchModeArg::Cpu => SearchMode::Cpu,
+        SearchModeArg::Gpu | SearchModeArg::Hybrid => {
+            #[cfg(feature = "opencl")]
+            {
+                if cosmos_vanity_gpu::opencl::is_available() {
+                    requested.to_search_mode()
+                } else {
+                    eprintln!(
+                        "⚠️  No OpenCL GPU found, falling back to CPU mode (requested: {})",
+                        requested.label()
+                    );
+                    SearchMode::Cpu
+                }
+            }
+            #[cfg(not(feature = "opencl"))]
+            {
+                eprintln!(
+                    "⚠️  OpenCL support not compiled in, falling back to CPU mode (requested: {})",
+                    requested.label()
+                );
+                SearchMode::Cpu
+            }
+        }
+    }
 }
 
 fn ctrlc_handler(stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {

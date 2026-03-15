@@ -247,7 +247,7 @@ impl GpuContext {
         Ok((hashes, matches))
     }
 
-    /// Suggested batch size based on device capabilities.
+    /// Suggested batch size for hybrid mode.
     ///
     /// For the hybrid pipeline, we want large batches (32K-64K+) to
     /// amortize GPU kernel launch overhead. The CPU keygen threads
@@ -260,6 +260,20 @@ impl GpuContext {
         let base = self.max_compute_units as usize * waves_per_cu * wave_size;
         // Round up to power-of-2, minimum 32K for amortized dispatch overhead
         base.max(32_768).next_power_of_two()
+    }
+
+    /// Batch size for pure GPU mode — maximum GPU occupancy.
+    ///
+    /// Uses larger batches (64K-128K) to maximize GPU utilization.
+    /// RX 9070 XT: 32 CUs × 64 wavefront × 8 waves = 16K minimum,
+    /// so 64K-128K provides excellent occupancy with amortized dispatch.
+    pub fn pure_gpu_batch_size(&self) -> usize {
+        // For pure GPU mode, go bigger to maximize GPU occupancy
+        let waves_per_cu = 32; // More waves for pure GPU saturation
+        let wave_size = 64; // AMD wavefront size
+        let base = self.max_compute_units as usize * waves_per_cu * wave_size;
+        // Minimum 65536 (64K), cap at 131072 (128K) for memory efficiency
+        base.max(65_536).min(131_072).next_power_of_two()
     }
 }
 
