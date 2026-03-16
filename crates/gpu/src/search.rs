@@ -9,7 +9,7 @@ use chrono::Utc;
 use crossbeam_channel::{bounded, Receiver};
 
 use cosmos_vanity_address::{encode_bech32, pubkey_to_bech32, VanityPattern};
-use cosmos_vanity_keyderiv::generate_random_keypair_with_path;
+use cosmos_vanity_keyderiv::{generate_random_keypair_with_path, generate_random_keypair_with_words};
 
 use crate::state::SearchState;
 
@@ -85,6 +85,9 @@ pub struct SearchConfig {
     /// Key generation mode
     pub key_mode: KeyMode,
 
+    /// Mnemonic word count: 12 (128-bit) or 24 (256-bit)
+    pub mnemonic_words: u8,
+
     /// Maximum number of matches to find (0 = unlimited)
     pub max_matches: usize,
 
@@ -104,6 +107,7 @@ impl Default for SearchConfig {
             num_threads: num_cpus::get(),
             mode: SearchMode::Cpu,
             key_mode: KeyMode::default(),
+            mnemonic_words: 12,
             max_matches: 1,
             checkpoint_interval: 100_000,
             state_file: None,
@@ -206,6 +210,7 @@ impl VanitySearcher {
 
         let start = Instant::now();
         let num_threads = self.config.num_threads;
+        let mnemonic_words = self.config.mnemonic_words;
         let pattern = self.config.pattern.clone();
         let hrp = self.config.hrp.clone();
         let path = self.config.derivation_path.clone();
@@ -254,7 +259,7 @@ impl VanitySearcher {
                         }
 
                         // Generate a candidate
-                        let key = match generate_random_keypair_with_path(&path) {
+                        let key = match generate_random_keypair_with_words(&path, mnemonic_words) {
                             Ok(k) => k,
                             Err(e) => {
                                 tracing::error!("Key generation error: {e}");
@@ -346,6 +351,7 @@ impl VanitySearcher {
         let pattern = self.config.pattern.clone();
         let hrp = self.config.hrp.clone();
         let path = self.config.derivation_path.clone();
+        let mnemonic_words = self.config.mnemonic_words;
         let max_matches = self.config.max_matches;
         let counter = Arc::clone(&self.candidates_checked);
         let stop_flag = Arc::clone(&self.should_stop);
@@ -386,7 +392,7 @@ impl VanitySearcher {
                             break;
                         }
 
-                        let key = match generate_random_keypair_with_path(&path) {
+                        let key = match generate_random_keypair_with_words(&path, mnemonic_words) {
                             Ok(k) => k,
                             Err(e) => {
                                 tracing::error!("Key generation error: {e}");
@@ -460,7 +466,7 @@ impl VanitySearcher {
                             break;
                         }
 
-                        let key = match generate_random_keypair_with_path(&path) {
+                        let key = match generate_random_keypair_with_words(&path, mnemonic_words) {
                             Ok(k) => k,
                             Err(e) => {
                                 tracing::error!("Keygen error: {e}");
@@ -630,6 +636,7 @@ impl VanitySearcher {
         let pattern = self.config.pattern.clone();
         let hrp = self.config.hrp.clone();
         let path = self.config.derivation_path.clone();
+        let mnemonic_words = self.config.mnemonic_words;
         let max_matches = self.config.max_matches;
         let counter = Arc::clone(&self.candidates_checked);
         let stop_flag = Arc::clone(&self.should_stop);
@@ -677,7 +684,7 @@ impl VanitySearcher {
                             break;
                         }
 
-                        let key = match generate_random_keypair_with_path(&path) {
+                        let key = match generate_random_keypair_with_words(&path, mnemonic_words) {
                             Ok(k) => k,
                             Err(e) => {
                                 tracing::error!("Keygen error: {e}");
@@ -1024,6 +1031,7 @@ impl VanitySearcher {
         let (mnem_tx, mnem_rx) = bounded::<(Vec<u8>, String)>(batch_size * 3);
 
         // Spawn CPU threads that just generate random mnemonics (very fast — no PBKDF2)
+        let mnemonic_words = self.config.mnemonic_words;
         for thread_id in 0..num_threads {
             let mnem_tx = mnem_tx.clone();
             let stop_flag = Arc::clone(&stop_flag);
@@ -1037,9 +1045,11 @@ impl VanitySearcher {
                         if max_matches > 0 && matches_found.load(Ordering::Relaxed) >= max_matches as u64 { break; }
 
                         // Generate random mnemonic — just entropy + word lookup, NO PBKDF2
+                        // 12 words = 16 bytes entropy, 24 words = 32 bytes entropy
+                        let entropy_len = if mnemonic_words == 12 { 16 } else { 32 };
                         let mut entropy = [0u8; 32];
-                        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy);
-                        let mnemonic: Mnemonic = match Mnemonic::from_entropy(&entropy) {
+                        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy[..entropy_len]);
+                        let mnemonic: Mnemonic = match Mnemonic::from_entropy(&entropy[..entropy_len]) {
                             Ok(m) => m,
                             Err(_) => continue,
                         };
@@ -1244,6 +1254,7 @@ mod tests {
             num_threads: 2,
             mode: SearchMode::Cpu,
             key_mode: KeyMode::Mnemonic,
+            mnemonic_words: 12,
             max_matches: 1,
             checkpoint_interval: 1000,
             state_file: None,

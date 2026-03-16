@@ -65,6 +65,10 @@ enum Commands {
         #[arg(short = 'k', long, default_value = "raw")]
         key_mode: KeyModeArg,
 
+        /// Mnemonic word count: 12 (128-bit, Keplr default) or 24 (256-bit)
+        #[arg(short = 'w', long, default_value = "12")]
+        words: u8,
+
         /// Maximum number of matches to find
         #[arg(short = 'n', long, default_value = "1")]
         max_matches: usize,
@@ -203,6 +207,7 @@ fn main() -> Result<()> {
             max_matches,
             state_file,
             checkpoint_interval,
+            words,
         } => {
             let vanity_pattern = match match_type {
                 MatchType::Prefix => VanityPattern::Prefix(pattern),
@@ -230,6 +235,7 @@ fn main() -> Result<()> {
                 key_mode: effective_key_mode,
                 max_matches,
                 checkpoint_interval,
+                mnemonic_words: words,
                 state_file,
             };
 
@@ -248,6 +254,9 @@ fn main() -> Result<()> {
             println!("   Threads:  {}", config.num_threads);
             println!("   Mode:     {mode_label}");
             println!("   Key mode: {effective_key_mode}");
+            if effective_key_mode == KeyMode::Mnemonic {
+                println!("   Words:    {words}");
+            }
             println!("   Max hits: {max_matches}");
             println!("   Difficulty: ~{} avg candidates ({})", format_number(expected_candidates), difficulty_label);
             println!();

@@ -1,50 +1,66 @@
 # cosmos-vanity-amd ⚡
 
-Generate vanity wallet addresses for the Cosmos ecosystem using AMD GPU acceleration via ROCm/OpenCL.
+Generate vanity wallet addresses for the Cosmos ecosystem using AMD GPU acceleration via ROCm/OpenCL. Full secp256k1 elliptic curve math and BIP-39/BIP-32 derivation on GPU.
+
+## Performance
+
+Benchmarked on AMD Radeon RX 9070 XT (gfx1201, 32 CUs, ROCm 7.2):
+
+| Mode | Throughput | Description |
+|------|-----------|-------------|
+| **GPU raw** | ~1,000,000/s | Private key → secp256k1 → hash on GPU |
+| **GPU mnemonic** | ~21,000/s | Full BIP-39 pipeline (PBKDF2 + BIP-32 + secp256k1) on GPU |
+| CPU mnemonic | ~12,000/s | Traditional CPU-only search |
+
+### Expected search times (GPU raw mode)
+
+| Prefix | Attempts | Time |
+|--------|----------|------|
+| 3 chars | ~32K | < 1s |
+| 4 chars | ~1M | ~1s |
+| 5 chars | ~33M | ~30s |
+| 6 chars | ~1B | ~17min |
+| 7 chars | ~34B | ~9h |
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        CLI (clap)                           │
-│              Progress display, structured output            │
-├───────────┬───────────┬───────────┬──────────┬──────────────┤
-│  keyderiv │  address  │    gpu    │  verify  │    bench     │
-│           │           │           │          │              │
-│ BIP-39    │ SHA-256   │ OpenCL    │ CPU re-  │ Criterion    │
-│ BIP-32/44 │ RIPEMD160 │ kernel    │ derive   │ benchmarks   │
-│ secp256k1 │ Bech32    │ mgmt      │ & check  │              │
-│           │           │           │          │              │
-│ Mnemonic  │ Cosmos    │ ROCm/AMD  │ Every    │ Throughput   │
-│ generation│ address   │ GPU batch │ GPU hit  │ measurement  │
-│ & HD key  │ encoding  │ hashing   │ verified │              │
-│ derivation│           │           │ on CPU   │              │
-└───────────┴───────────┴───────────┴──────────┴──────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                          CLI (clap)                                  │
+│          --mode gpu|hybrid|cpu  --key-mode raw|mnemonic              │
+├────────────┬───────────┬───────────────────┬──────────┬──────────────┤
+│  keyderiv  │  address  │       gpu         │  verify  │    bench     │
+│            │           │                   │          │              │
+│ BIP-39     │ SHA-256   │ OpenCL Kernels:   │ CPU re-  │ Throughput   │
+│ BIP-32/44  │ RIPEMD160 │  • secp256k1.cl   │ derive   │ measurement  │
+│ secp256k1  │ Bech32    │  • vanity_search  │ & verify │              │
+│            │           │  • mnemonic_pipe  │          │              │
+└────────────┴───────────┴───────────────────┴──────────┴──────────────┘
 ```
+
+### GPU Kernels
+
+| Kernel | Operations | Used by |
+|--------|-----------|---------|
+| `secp256k1.cl` | 256-bit field math, Jacobian EC point ops, scalar mul, SHA-256, RIPEMD-160, prefix matching | `--key-mode raw` |
+| `mnemonic_pipeline.cl` | SHA-512, HMAC-SHA512, PBKDF2 (2048 rounds), BIP-32 derivation, + secp256k1 pipeline | `--key-mode mnemonic` |
+| `vanity_search.cl` | SHA-256, RIPEMD-160, prefix matching | hybrid/legacy modes |
 
 ### Data Flow
 
+**Raw mode** (fastest):
 ```
-1. CPU: Generate random BIP-39 mnemonic (24 words)
-2. CPU: Derive secp256k1 keypair via BIP-44 (m/44'/118'/0'/0/0)
-3. GPU: Batch SHA-256 + RIPEMD-160 hashing of public keys
-4. GPU: Prefix/pattern matching on raw address bytes
-5. CPU: Bech32 encode matched candidates
-6. CPU: Full re-derivation verification of every match
-7. Output: Address + mnemonic + derivation path
+CPU: Random 32-byte private key → GPU
+GPU: secp256k1(privkey) → pubkey → SHA-256 → RIPEMD-160 → prefix match
+CPU: Verify match, output address + private key
 ```
 
-## Features
-
-- **Vanity address generation** — find addresses matching custom prefix/suffix/contains/regex patterns
-- **AMD GPU acceleration** — OpenCL kernels for parallel SHA-256 + RIPEMD-160 on ROCm
-- **CPU fallback** — works without GPU, just slower
-- **Multi-chain support** — configurable HRPs (cosmos, osmo, juno, stars, akash, etc.)
-- **BIP-44 compliant** — standard Cosmos SDK derivation (coin type 118)
-- **Verification** — every GPU match independently verified on CPU before reporting
-- **Resumable** — save/restore search state across sessions
-- **Structured output** — text or JSON output formats
-- **Secure** — sensitive memory zeroized on drop
+**Mnemonic mode** (BIP-39 compatible):
+```
+CPU: Random entropy → BIP-39 mnemonic (word lookup) → GPU
+GPU: PBKDF2(mnemonic, 2048 rounds) → BIP-32 derive → secp256k1 → SHA-256 → RIPEMD-160 → match
+CPU: Verify match, output address + mnemonic phrase
+```
 
 ## Build Instructions (Ubuntu 24.04)
 
@@ -59,7 +75,7 @@ source ~/.cargo/env
 sudo apt install -y build-essential pkg-config libssl-dev
 ```
 
-### CPU-only build (no GPU required)
+### CPU-only build
 
 ```bash
 cargo build --release
@@ -67,151 +83,175 @@ cargo build --release
 
 ### GPU build (AMD ROCm/OpenCL)
 
-#### ROCm Setup
-
 ```bash
-# Add ROCm repository (Ubuntu 24.04)
+# Install ROCm (Ubuntu 24.04)
 wget https://repo.radeon.com/amdgpu-install/latest/ubuntu/noble/amdgpu-install_6.4.60400-1_all.deb
 sudo dpkg -i amdgpu-install_6.4.60400-1_all.deb
 sudo amdgpu-install --usecase=rocm,opencl
 
-# Install OpenCL development headers
+# Install OpenCL dev headers
 sudo apt install -y rocm-opencl-dev ocl-icd-opencl-dev
 
-# Add user to render/video groups
+# Add user to GPU groups
 sudo usermod -aG render,video $USER
+# Log out and back in (or reboot)
 
-# Verify
-clinfo  # Should show your AMD GPU
-```
+# Verify GPU is detected
+clinfo | grep "Board name"
 
-#### Build with OpenCL
-
-```bash
+# Build with GPU support
 cargo build --release --features opencl
 ```
 
 ## Usage
 
-### Search for a vanity address
+### Quick start
 
 ```bash
-# Find an address starting with "cosmos1aaa"
-cosmos-vanity search --pattern aaa
+# Fastest: raw private key mode (GPU default)
+cosmos-vanity search -p abc
 
-# Different chain
-cosmos-vanity search --pattern dead --hrp osmo
+# With mnemonic phrase output (12-word, Keplr compatible)
+cosmos-vanity search -p abc -k mnemonic
 
-# Suffix matching
-cosmos-vanity search --pattern 420 --match-type suffix
+# 24-word mnemonic
+cosmos-vanity search -p abc -k mnemonic -w 24
 
-# Contains matching
-cosmos-vanity search --pattern cafe --match-type contains
+# Different chain (Osmosis)
+cosmos-vanity search -p cool --hrp osmo
 
-# Multiple matches with JSON output
-cosmos-vanity search --pattern aa --max-matches 5 --format json
-
-# Custom derivation path
-cosmos-vanity search --pattern abc --path "m/44'/118'/1'/0/0"
-
-# GPU accelerated (requires --features opencl build)
-cosmos-vanity search --pattern aaaa --gpu
-
-# Resumable search
-cosmos-vanity search --pattern aaaaa --state-file search.json
-
-# Control thread count
-cosmos-vanity search --pattern aaa -j 8
+# CPU only (no GPU needed)
+cosmos-vanity search -p abc -m cpu -k mnemonic
 ```
 
-### Generate a random address
+### Search modes (`--mode`, `-m`)
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| **gpu** | `-m gpu` | Pure GPU — all CPU cores feed keys, GPU does all compute. **Default.** |
+| hybrid | `-m hybrid` | CPU search threads + GPU pipeline in parallel |
+| cpu | `-m cpu` | CPU only, no GPU acceleration |
+
+### Key modes (`--key-mode`, `-k`)
+
+| Mode | Flag | Output | Speed |
+|------|------|--------|-------|
+| **raw** | `-k raw` | Hex private key | ~1M/s on GPU |
+| mnemonic | `-k mnemonic` | BIP-39 seed phrase | ~21K/s on GPU |
+
+### Mnemonic word count (`--words`, `-w`)
+
+| Words | Flag | Entropy | Compatible with |
+|-------|------|---------|----------------|
+| **12** | `-w 12` | 128-bit | Keplr, MetaMask, Cosmostation (default for new wallets) |
+| 24 | `-w 24` | 256-bit | Ledger, older wallets, maximum security |
+
+### All search options
 
 ```bash
-cosmos-vanity generate
-cosmos-vanity generate --hrp osmo
-cosmos-vanity generate --format json
+cosmos-vanity search [OPTIONS] --pattern <PATTERN>
+
+Options:
+  -p, --pattern <PATTERN>      Pattern to search for
+  -t, --match-type <TYPE>      prefix (default), suffix, contains, regex
+      --hrp <HRP>              Chain prefix: cosmos, osmo, juno, etc. [default: cosmos]
+  -m, --mode <MODE>            gpu, hybrid, cpu [default: gpu]
+  -k, --key-mode <MODE>        raw, mnemonic [default: raw]
+  -w, --words <N>              Mnemonic words: 12 or 24 [default: 12]
+  -j, --threads <N>            CPU threads [default: all cores]
+  -n, --max-matches <N>        Stop after N matches [default: 1]
+      --path <PATH>            BIP-44 derivation path [default: m/44'/118'/0'/0/0]
+      --state-file <FILE>      Save/resume search state
+      --format <FMT>           text or json [default: text]
 ```
 
-### Verify a mnemonic
+### Other commands
 
 ```bash
-cosmos-vanity verify \
-  --mnemonic "word1 word2 ... word24" \
-  --address "cosmos1abc..."
-```
+# Generate a random address
+cosmos-vanity generate --hrp cosmos
 
-### Run benchmarks
+# Verify a mnemonic produces an address
+cosmos-vanity verify --mnemonic "word1 word2 ..." --address "cosmos1..."
 
-```bash
+# Run benchmarks
 cosmos-vanity bench --iterations 10000
 ```
 
-## Pattern Difficulty
+### Supported chains
 
-The Bech32 character set has 32 characters. Expected attempts for prefix matches:
+Any Cosmos SDK chain — just set `--hrp`:
 
-| Prefix Length | Expected Attempts | ~Time (1000 addr/s) | ~Time (1M addr/s GPU) |
-|---------------|-------------------|---------------------|-----------------------|
-| 1 char        | 32                | <1s                 | <1ms                  |
-| 2 chars       | 1,024             | ~1s                 | ~1ms                  |
-| 3 chars       | 32,768            | ~33s                | ~33ms                 |
-| 4 chars       | 1,048,576         | ~17min              | ~1s                   |
-| 5 chars       | 33,554,432        | ~9h                 | ~34s                  |
-| 6 chars       | 1,073,741,824     | ~12 days            | ~18min                |
-| 7 chars       | 34,359,738,368    | ~1 year             | ~10h                  |
+| Chain | HRP |
+|-------|-----|
+| Cosmos Hub | `cosmos` |
+| Osmosis | `osmo` |
+| Juno | `juno` |
+| Stargaze | `stars` |
+| Akash | `akash` |
+| Celestia | `celestia` |
+| Injective | `inj` |
+| dYdX | `dydx` |
+| Noble | `noble` |
+| ... | any bech32 HRP |
 
-## Security Considerations
+### Bech32 character set
+
+Valid pattern characters: `qpzry9x8gf2tvdw0s3jn54khce6mua7l`
+
+Note: letters `b`, `i`, `o`, `1` are NOT valid in Bech32.
+
+## Security
 
 ### ⚠️ CRITICAL
 
-1. **Mnemonic safety** — The mnemonic phrase gives full control of funds. Never share it, log it, or store it unencrypted.
+- **Mnemonic/private key = full wallet control.** Never share, log, or store unencrypted.
+- **Zeroize** — sensitive memory is cleared on drop via the `zeroize` crate.
+- **GPU memory** — VRAM may retain data after kernel execution. Power cycle GPU for production keys.
+- **Verification** — every GPU match is independently re-derived and verified on CPU.
 
-2. **Memory handling** — This tool uses [`zeroize`](https://crates.io/crates/zeroize) to clear sensitive data from memory when no longer needed. However:
-   - The OS may swap memory to disk
-   - Core dumps could contain secrets
-   - Compiler optimizations could copy data
+### Recommended practices
 
-3. **Recommended practices:**
-   - Run on an air-gapped machine
-   - Disable swap: `sudo swapoff -a`
-   - Disable core dumps: `ulimit -c 0`
-   - Clear terminal history after use
-   - Use encrypted disk
-   - Verify the generated address with an independent tool before funding
+```bash
+# Disable swap
+sudo swapoff -a
 
-4. **GPU memory** — GPU VRAM may retain data after kernel execution. Power cycle the GPU after generating production keys.
+# Disable core dumps
+ulimit -c 0
 
-5. **Entropy** — We use the system's CSPRNG via the `rand` crate's `OsRng`. Ensure your system has adequate entropy (most modern Linux systems do via `/dev/urandom`).
-
-6. **Verification** — Every match is independently re-derived and verified on CPU. Never trust a GPU result without verification.
+# Run on air-gapped machine for production keys
+# Use encrypted disk
+# Clear terminal history after use
+# Verify generated address with an independent wallet before funding
+```
 
 ## Development
 
 ```bash
 # Run all tests
+cargo test --workspace --features opencl
+
+# CPU-only tests (no GPU needed)
 cargo test --workspace
 
-# Run specific crate tests
-cargo test -p cosmos-vanity-keyderiv
-cargo test -p cosmos-vanity-address
-
-# Run benchmarks
-cargo bench -p cosmos-vanity-bench
-
-# Check without building (no GPU needed)
-cargo check --workspace
-
-# Check with GPU features
-cargo check --workspace --features cosmos-vanity-gpu/opencl
-
 # Lint
-cargo clippy --workspace
+cargo clippy --workspace --features opencl
+
+# Build check only
+cargo check --workspace --features opencl
 ```
+
+## Crate structure
+
+| Crate | Purpose |
+|-------|---------|
+| `cli` | Command-line interface, progress display |
+| `keyderiv` | BIP-39 mnemonic, BIP-32/44 HD derivation, secp256k1 |
+| `address` | SHA-256, RIPEMD-160, Bech32 encoding, pattern matching |
+| `gpu` | OpenCL kernel management, GPU search engine, CPU fallback |
+| `verify` | Independent CPU verification of matches |
+| `bench` | Benchmarking utilities |
 
 ## License
 
 MIT
-
-## Contributing
-
-PRs welcome. Security-sensitive changes require extra review.

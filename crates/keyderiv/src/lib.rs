@@ -114,9 +114,16 @@ pub fn generate_random_keypair() -> Result<DerivedKey, KeyDerivError> {
 /// Generate a random 24-word BIP-39 mnemonic and derive the keypair
 /// using a custom derivation path.
 pub fn generate_random_keypair_with_path(path: &str) -> Result<DerivedKey, KeyDerivError> {
-    let mut entropy = [0u8; 32]; // 256 bits = 24 words
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy);
-    let mnemonic = Mnemonic::from_entropy(&entropy)
+    generate_random_keypair_with_words(path, 24)
+}
+
+/// Generate a random BIP-39 mnemonic with the specified word count and derive the keypair.
+/// Supported: 12 words (128-bit entropy) or 24 words (256-bit entropy).
+pub fn generate_random_keypair_with_words(path: &str, words: u8) -> Result<DerivedKey, KeyDerivError> {
+    let entropy_len = if words == 12 { 16 } else { 32 };
+    let mut entropy = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy[..entropy_len]);
+    let mnemonic = Mnemonic::from_entropy(&entropy[..entropy_len])
         .map_err(|e| KeyDerivError::Bip39(e.to_string()))?;
     entropy.zeroize();
     derive_keypair_from_mnemonic(&mnemonic.to_string(), path)
