@@ -104,7 +104,11 @@ impl std::fmt::Display for BenchResult {
         writeln!(f, "Benchmark Results:")?;
         writeln!(f, "  Iterations:     {}", self.iterations)?;
         writeln!(f, "  Duration:       {:.3}s", self.duration_secs)?;
-        writeln!(f, "  Throughput:     {:.0} addr/sec", self.addresses_per_sec)?;
+        writeln!(
+            f,
+            "  Throughput:     {:.0} addr/sec",
+            self.addresses_per_sec
+        )?;
         writeln!(f, "  Avg per addr:   {:.1} µs", self.avg_us_per_address)?;
         writeln!(f, "  GPU:            {}", self.gpu)?;
         writeln!(f, "  Threads:        {}", self.threads)?;

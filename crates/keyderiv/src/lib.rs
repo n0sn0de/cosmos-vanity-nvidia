@@ -91,8 +91,6 @@ impl DerivedKey {
     }
 }
 
-
-
 /// Derive compressed public key from raw 32-byte private key (for GPU verification).
 ///
 /// This is a direct secp256k1 scalar multiplication without BIP-39/BIP-32.
@@ -119,7 +117,10 @@ pub fn generate_random_keypair_with_path(path: &str) -> Result<DerivedKey, KeyDe
 
 /// Generate a random BIP-39 mnemonic with the specified word count and derive the keypair.
 /// Supported: 12 words (128-bit entropy) or 24 words (256-bit entropy).
-pub fn generate_random_keypair_with_words(path: &str, words: u8) -> Result<DerivedKey, KeyDerivError> {
+pub fn generate_random_keypair_with_words(
+    path: &str,
+    words: u8,
+) -> Result<DerivedKey, KeyDerivError> {
     let entropy_len = if words == 12 { 16 } else { 32 };
     let mut entropy = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy[..entropy_len]);
@@ -174,12 +175,7 @@ pub fn cosmos_derivation_path(coin_type: u32) -> String {
 }
 
 /// Build a full custom derivation path.
-pub fn custom_derivation_path(
-    coin_type: u32,
-    account: u32,
-    change: u32,
-    index: u32,
-) -> String {
+pub fn custom_derivation_path(coin_type: u32, account: u32, change: u32, index: u32) -> String {
     format!("m/44'/{coin_type}'/{account}'/{change}/{index}")
 }
 
@@ -240,4 +236,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-

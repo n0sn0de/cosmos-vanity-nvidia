@@ -117,12 +117,18 @@ pub fn verify_privkey_address(
     expected_address: &str,
 ) -> Result<bool, VerifyError> {
     let hex_str = privkey_hex.strip_prefix("0x").unwrap_or(privkey_hex);
-    let privkey_bytes = hex::decode(hex_str)
-        .map_err(|e| VerifyError::KeyDerivation(cosmos_vanity_keyderiv::KeyDerivError::Bip39(format!("Invalid hex: {e}"))))?;
+    let privkey_bytes = hex::decode(hex_str).map_err(|e| {
+        VerifyError::KeyDerivation(cosmos_vanity_keyderiv::KeyDerivError::Bip39(format!(
+            "Invalid hex: {e}"
+        )))
+    })?;
     if privkey_bytes.len() != 32 {
-        return Err(VerifyError::KeyDerivation(cosmos_vanity_keyderiv::KeyDerivError::Bip39(
-            format!("Private key must be 32 bytes, got {}", privkey_bytes.len())
-        )));
+        return Err(VerifyError::KeyDerivation(
+            cosmos_vanity_keyderiv::KeyDerivError::Bip39(format!(
+                "Private key must be 32 bytes, got {}",
+                privkey_bytes.len()
+            )),
+        ));
     }
     let privkey: [u8; 32] = privkey_bytes.try_into().unwrap();
     let pubkey = cosmos_vanity_keyderiv::pubkey_from_privkey(&privkey)?;
@@ -157,8 +163,7 @@ mod tests {
         )
         .unwrap();
 
-        let address =
-            pubkey_to_bech32(key.public_key_bytes(), "cosmos").unwrap();
+        let address = pubkey_to_bech32(key.public_key_bytes(), "cosmos").unwrap();
 
         // Now verify it
         let result = verify_address(
@@ -193,8 +198,7 @@ mod tests {
         )
         .unwrap();
 
-        let address =
-            pubkey_to_bech32(key.public_key_bytes(), "cosmos").unwrap();
+        let address = pubkey_to_bech32(key.public_key_bytes(), "cosmos").unwrap();
 
         // Get the first char after "cosmos1" for a guaranteed prefix match
         let first_char = address
@@ -226,8 +230,7 @@ mod tests {
         )
         .unwrap();
 
-        let address =
-            pubkey_to_bech32(key.public_key_bytes(), "cosmos").unwrap();
+        let address = pubkey_to_bech32(key.public_key_bytes(), "cosmos").unwrap();
 
         // Use a pattern that definitely won't match (all z's)
         let pattern = VanityPattern::Prefix("zzzzzzzz".to_string());

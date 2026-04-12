@@ -1,22 +1,19 @@
 //! # cosmos-vanity-gpu
 //!
-//! OpenCL/ROCm GPU acceleration for Cosmos vanity address generation.
+//! GPU acceleration for Cosmos vanity address generation.
 //!
-//! When compiled with the `opencl` feature, this crate uses AMD GPUs via ROCm
-//! to accelerate the SHA-256 + RIPEMD-160 hashing pipeline. Falls back to
-//! CPU-based searching when GPU is unavailable.
+//! Supported backends:
+//! - OpenCL (AMD/ROCm, and other OpenCL-capable devices)
+//! - CUDA (NVIDIA, via the CUDA driver + NVRTC)
 //!
-//! ## Architecture
-//!
-//! The GPU handles the bulk hashing work:
-//! 1. CPU generates random mnemonics and derives secp256k1 public keys
-//! 2. Public keys are batched and sent to GPU
-//! 3. GPU computes SHA-256(pubkey) → RIPEMD-160 for all keys in parallel
-//! 4. GPU checks for prefix matches on raw address bytes
-//! 5. Matches are returned to CPU for full Bech32 verification
+//! When no GPU backend is compiled or available, the crate falls back to
+//! CPU-based searching.
 
 pub mod search;
 pub mod state;
+
+#[cfg(any(feature = "opencl", feature = "cuda"))]
+pub(crate) mod backend;
 
 #[cfg(feature = "opencl")]
 pub mod opencl;
@@ -24,8 +21,6 @@ pub mod opencl;
 #[cfg(not(feature = "opencl"))]
 pub mod opencl {
     //! Stub module when OpenCL is not available.
-    //!
-    //! All GPU functions return errors indicating GPU is unavailable.
 
     use thiserror::Error;
 
@@ -35,12 +30,12 @@ pub mod opencl {
         NotAvailable,
     }
 
-    /// Check if GPU acceleration is available.
+    /// Check if OpenCL GPU acceleration is available.
     pub fn is_available() -> bool {
         false
     }
 
-    /// Placeholder GPU context.
+    /// Placeholder OpenCL context.
     pub struct GpuContext;
 
     impl GpuContext {
@@ -50,5 +45,50 @@ pub mod opencl {
     }
 }
 
-pub use search::{KeyMode, SearchConfig, SearchMode, SearchResult, VanitySearcher};
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
+#[cfg(not(feature = "cuda"))]
+pub mod cuda {
+    //! Stub module when CUDA is not available.
+
+    use thiserror::Error;
+
+    #[derive(Debug, Error)]
+    pub enum GpuError {
+        #[error("CUDA support not compiled in. Rebuild with --features cuda")]
+        NotAvailable,
+    }
+
+    /// Check if CUDA GPU acceleration is available.
+    pub fn is_available() -> bool {
+        false
+    }
+
+    /// Placeholder CUDA context.
+    pub struct GpuContext;
+
+    impl GpuContext {
+        pub fn new() -> Result<Self, GpuError> {
+            Err(GpuError::NotAvailable)
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) mod backend_tests;
+
+pub use search::{GpuApi, KeyMode, SearchConfig, SearchMode, SearchResult, VanitySearcher};
 pub use state::SearchState;
+
+/// Returns true if the requested GPU API is available on this machine.
+#[cfg(any(feature = "opencl", feature = "cuda"))]
+pub fn is_gpu_api_available(api: GpuApi) -> bool {
+    backend::ActiveGpuContext::is_available(api)
+}
+
+/// Returns false when GPU backends were not compiled in.
+#[cfg(not(any(feature = "opencl", feature = "cuda")))]
+pub fn is_gpu_api_available(_api: GpuApi) -> bool {
+    false
+}

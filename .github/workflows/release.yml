@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: cosmos-vanity-linux-x86_64-cpu
+            features: ''
+          - artifact_name: cosmos-vanity-linux-x86_64-gpu
+            features: 'opencl cuda'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocl-icd-opencl-dev clinfo
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ matrix.features }}" ]]; then
+            cargo build --release -p cosmos-vanity-cli --features "${{ matrix.features }}"
+          else
+            cargo build --release -p cosmos-vanity-cli
+          fi
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/${{ matrix.artifact_name }}
+          cp target/release/cosmos-vanity dist/${{ matrix.artifact_name }}/
+          cp README.md dist/${{ matrix.artifact_name }}/
+          tar -C dist -czf dist/${{ matrix.artifact_name }}.tar.gz ${{ matrix.artifact_name }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}.tar.gz
+
+  windows:
+    name: Windows artifacts
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: cosmos-vanity-windows-x86_64-cpu
+            features: ''
+          - artifact_name: cosmos-vanity-windows-x86_64-cuda
+            features: 'cuda'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ matrix.features }}" ]]; then
+            cargo build --release -p cosmos-vanity-cli --features "${{ matrix.features }}"
+          else
+            cargo build --release -p cosmos-vanity-cli
+          fi
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          $dir = "dist/${{ matrix.artifact_name }}"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item target/release/cosmos-vanity.exe $dir/
+          Copy-Item README.md $dir/
+          Compress-Archive -Path "$dir/*" -DestinationPath "dist/${{ matrix.artifact_name }}.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}.zip
+
+  publish:
+    name: Publish GitHub release assets
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs:
+      - linux
+      - windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

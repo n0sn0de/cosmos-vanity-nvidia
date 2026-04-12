@@ -3,14 +3,16 @@ name = "cosmos-vanity-gpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "OpenCL/ROCm GPU acceleration for Cosmos vanity address generation"
+description = "OpenCL and CUDA GPU acceleration for Cosmos vanity address generation"
 
 [features]
 default = []
 opencl = ["dep:ocl"]
+cuda = ["dep:cudarc"]
 
 [dependencies]
 ocl = { workspace = true, optional = true }
+cudarc = { workspace = true, optional = true }
 cosmos-vanity-keyderiv = { workspace = true }
 cosmos-vanity-address = { workspace = true }
 sha2 = { workspace = true }

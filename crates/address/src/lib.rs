@@ -52,7 +52,7 @@ pub fn pubkey_to_address_bytes(compressed_pubkey: &[u8]) -> Result<[u8; 20], Add
     let sha_hash = Sha256::digest(compressed_pubkey);
 
     // RIPEMD-160
-    let ripemd_hash = Ripemd160::digest(&sha_hash);
+    let ripemd_hash = Ripemd160::digest(sha_hash);
 
     let mut result = [0u8; 20];
     result.copy_from_slice(&ripemd_hash);
@@ -62,8 +62,8 @@ pub fn pubkey_to_address_bytes(compressed_pubkey: &[u8]) -> Result<[u8; 20], Add
 /// Encode a 20-byte address hash as a Bech32 address with the given HRP.
 pub fn encode_bech32(hrp: &str, address_bytes: &[u8; 20]) -> Result<String, AddressError> {
     let hrp = Hrp::parse(hrp).map_err(|e| AddressError::InvalidHrp(e.to_string()))?;
-    let encoded =
-        bech32::encode::<Bech32>(hrp, address_bytes).map_err(|e| AddressError::Bech32(e.to_string()))?;
+    let encoded = bech32::encode::<Bech32>(hrp, address_bytes)
+        .map_err(|e| AddressError::Bech32(e.to_string()))?;
     Ok(encoded)
 }
 

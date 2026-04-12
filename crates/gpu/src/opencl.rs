@@ -3,6 +3,7 @@
 //! This module manages the GPU context, compiles the OpenCL kernel,
 //! and provides batch hashing of compressed public keys on AMD GPUs via ROCm.
 
+use ocl::core;
 use ocl::enums::{DeviceInfo, DeviceInfoResult};
 use ocl::{Buffer, Context, Device, Kernel, Platform, Program, Queue};
 use thiserror::Error;
@@ -14,6 +15,8 @@ const PUBKEY_SIZE: usize = 33;
 const HASH_SIZE: usize = 20;
 /// Size of a raw private key.
 const PRIVKEY_SIZE: usize = 32;
+
+type GpuBatchResult = (Vec<u8>, Vec<u8>, Vec<u32>);
 
 /// OpenCL kernel source (embedded at compile time).
 const KERNEL_SOURCE: &str = include_str!("kernels/vanity_search.cl");
@@ -37,16 +40,25 @@ pub enum GpuError {
     InvalidBatchSize,
 }
 
+fn list_platforms() -> Result<Vec<Platform>, GpuError> {
+    Ok(core::get_platform_ids()
+        .map_err(ocl::Error::from)?
+        .into_iter()
+        .map(Platform::new)
+        .collect())
+}
+
 /// Check if GPU acceleration is available.
 pub fn is_available() -> bool {
-    match Platform::list() {
-        platforms if platforms.is_empty() => false,
-        platforms => platforms.iter().any(|p| {
-            Device::list(p, Some(ocl::flags::DeviceType::GPU))
-                .map(|devs| !devs.is_empty())
-                .unwrap_or(false)
-        }),
-    }
+    let Ok(platforms) = list_platforms() else {
+        return false;
+    };
+
+    platforms.iter().any(|p| {
+        Device::list(p, Some(ocl::flags::DeviceType::GPU))
+            .map(|devs| !devs.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 /// GPU context holding the OpenCL queue, compiled programs, and device info.
@@ -63,7 +75,7 @@ pub struct GpuContext {
 impl GpuContext {
     /// Initialize GPU context — finds an AMD GPU, compiles the kernel.
     pub fn new() -> Result<Self, GpuError> {
-        let platform = Platform::list()
+        let platform = list_platforms()?
             .into_iter()
             .find(|p| {
                 Device::list(p, Some(ocl::flags::DeviceType::GPU))
@@ -72,12 +84,10 @@ impl GpuContext {
             })
             .ok_or(GpuError::NoPlatform)?;
 
-        let platform_name = platform
-            .name()
-            .unwrap_or_else(|_| "Unknown".to_string());
+        let platform_name = platform.name().unwrap_or_else(|_| "Unknown".to_string());
         info!("OpenCL platform: {}", platform_name);
 
-        let device = Device::list(&platform, Some(ocl::flags::DeviceType::GPU))?
+        let device = Device::list(platform, Some(ocl::flags::DeviceType::GPU))?
             .into_iter()
             .next()
             .ok_or(GpuError::NoDevice)?;
@@ -119,14 +129,19 @@ impl GpuContext {
                 Some(prog)
             }
             Err(e) => {
-                tracing::warn!("Failed to compile secp256k1 kernel: {e}. Raw key mode will be unavailable.");
+                tracing::warn!(
+                    "Failed to compile secp256k1 kernel: {e}. Raw key mode will be unavailable."
+                );
                 None
             }
         };
 
         // Compile mnemonic pipeline kernel (secp256k1.cl + mnemonic_pipeline.cl concatenated)
         let mnemonic_program = match Program::builder()
-            .src(format!("{}\n{}", SECP256K1_KERNEL_SOURCE, MNEMONIC_KERNEL_SOURCE))
+            .src(format!(
+                "{}\n{}",
+                SECP256K1_KERNEL_SOURCE, MNEMONIC_KERNEL_SOURCE
+            ))
             .devices(device)
             .build(&context)
         {
@@ -211,7 +226,9 @@ impl GpuContext {
             .build()?;
 
         // Execute
-        unsafe { kernel.enq()?; }
+        unsafe {
+            kernel.enq()?;
+        }
         self.queue.finish()?;
 
         // Read results
@@ -280,7 +297,9 @@ impl GpuContext {
             .arg(n as u32)
             .build()?;
 
-        unsafe { kernel.enq()?; }
+        unsafe {
+            kernel.enq()?;
+        }
         self.queue.finish()?;
 
         let mut hashes = vec![0u8; n * HASH_SIZE];
@@ -307,10 +326,11 @@ impl GpuContext {
         &self,
         privkeys: &[u8],
         prefix_bytes: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u32>), GpuError> {
-        let program = self.secp256k1_program.as_ref().ok_or_else(|| {
-            GpuError::Ocl(ocl::Error::from("secp256k1 kernel not compiled"))
-        })?;
+    ) -> Result<GpuBatchResult, GpuError> {
+        let program = self
+            .secp256k1_program
+            .as_ref()
+            .ok_or_else(|| GpuError::Ocl(ocl::Error::from("secp256k1 kernel not compiled")))?;
 
         let n = privkeys.len() / PRIVKEY_SIZE;
         if n == 0 {
@@ -371,7 +391,9 @@ impl GpuContext {
             .arg(n as u32)
             .build()?;
 
-        unsafe { kernel.enq()?; }
+        unsafe {
+            kernel.enq()?;
+        }
         self.queue.finish()?;
 
         // Read results
@@ -414,7 +436,7 @@ impl GpuContext {
         let wave_size = 64; // AMD wavefront size
         let base = self.max_compute_units as usize * waves_per_cu * wave_size;
         // Minimum 65536 (64K), cap at 131072 (128K) for memory efficiency
-        base.max(65_536).min(131_072).next_power_of_two()
+        base.clamp(65_536, 131_072).next_power_of_two()
     }
 
     /// Check if the mnemonic pipeline kernel is available.
@@ -430,7 +452,7 @@ impl GpuContext {
         let waves_per_cu = 4;
         let wave_size = 64;
         let base = self.max_compute_units as usize * waves_per_cu * wave_size;
-        base.max(2_048).min(8_192)
+        base.clamp(2_048, 8_192)
     }
 
     /// Run the full mnemonic pipeline on GPU.
@@ -438,9 +460,9 @@ impl GpuContext {
     /// Returns (derived_privkeys: N×32, hashes: N×20, matches: N×u32).
     pub fn mnemonic_batch(
         &self,
-        mnemonics_flat: &[u8],  // N × 256 bytes, zero-padded
-        mnemonic_lens: &[u32],  // N lengths
-    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u32>), GpuError> {
+        mnemonics_flat: &[u8], // N × 256 bytes, zero-padded
+        mnemonic_lens: &[u32], // N lengths
+    ) -> Result<GpuBatchResult, GpuError> {
         let program = self.mnemonic_program.as_ref().ok_or_else(|| {
             GpuError::Ocl(ocl::Error::from("Mnemonic pipeline kernel not compiled"))
         })?;
@@ -500,7 +522,9 @@ impl GpuContext {
             .arg(n as u32)
             .build()?;
 
-        unsafe { kernel.enq()?; }
+        unsafe {
+            kernel.enq()?;
+        }
         self.queue.finish()?;
 
         let mut privkeys = vec![0u8; n * 32];
@@ -561,7 +585,9 @@ mod tests {
         let test_pubkeys: Vec<[u8; 33]> = vec![
             // Test vector 1: from the address crate test
             hex::decode("02394bc53633366a2ab9b5d4a7b6a9cfd9f11d576e45e1e2049a2e397b6e1a4f2e")
-                .unwrap().try_into().unwrap(),
+                .unwrap()
+                .try_into()
+                .unwrap(),
             // Test vector 2: all zeros with 0x02 prefix
             {
                 let mut k = [0u8; 33];
@@ -578,8 +604,8 @@ mod tests {
             {
                 let mut k = [0u8; 33];
                 k[0] = 0x02;
-                for i in 1..33 {
-                    k[i] = i as u8;
+                for (i, byte) in k.iter_mut().enumerate().skip(1) {
+                    *byte = i as u8;
                 }
                 k
             },
@@ -592,7 +618,8 @@ mod tests {
         }
 
         // GPU hash
-        let gpu_hashes = ctx.hash_pubkeys_batch(&flat_pubkeys)
+        let gpu_hashes = ctx
+            .hash_pubkeys_batch(&flat_pubkeys)
             .expect("GPU hashing failed");
 
         // Compare each key
@@ -603,7 +630,8 @@ mod tests {
             let gpu_hash = &gpu_hashes[i * 20..(i + 1) * 20];
 
             assert_eq!(
-                cpu_hash.as_slice(), gpu_hash,
+                cpu_hash.as_slice(),
+                gpu_hash,
                 "Hash mismatch for test vector {i}!\n  pubkey: {}\n  CPU:    {}\n  GPU:    {}",
                 hex::encode(pk),
                 hex::encode(cpu_hash),
@@ -611,7 +639,10 @@ mod tests {
             );
         }
 
-        eprintln!("All {} test vectors matched between GPU and CPU!", test_pubkeys.len());
+        eprintln!(
+            "All {} test vectors matched between GPU and CPU!",
+            test_pubkeys.len()
+        );
     }
 
     /// Test with a real derived keypair from mnemonic.
@@ -692,11 +723,12 @@ mod tests {
         // Expected compressed pubkey for privkey=1 (generator point G):
         // 0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
         let expected_hex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-        let expected = hex::decode(expected_hex).unwrap();
 
         assert_eq!(
-            pubkeys.len(), 33,
-            "Expected 33-byte pubkey, got {} bytes", pubkeys.len()
+            pubkeys.len(),
+            33,
+            "Expected 33-byte pubkey, got {} bytes",
+            pubkeys.len()
         );
 
         assert_eq!(
@@ -707,7 +739,10 @@ mod tests {
             expected_hex,
         );
 
-        eprintln!("✅ GPU secp256k1 known vector test passed! pubkey={}", hex::encode(&pubkeys[..33]));
+        eprintln!(
+            "✅ GPU secp256k1 known vector test passed! pubkey={}",
+            hex::encode(&pubkeys[..33])
+        );
     }
 
     /// Test GPU secp256k1 matches CPU reference for multiple random keys.
@@ -756,7 +791,9 @@ mod tests {
             // A "real-looking" privkey
             {
                 let mut k = [0u8; 32];
-                for i in 0..32 { k[i] = (i as u8 + 1) * 7; }
+                for (i, byte) in k.iter_mut().enumerate() {
+                    *byte = (i as u8 + 1) * 7;
+                }
                 k
             },
         ];
@@ -773,13 +810,13 @@ mod tests {
 
         // Compare each
         for (i, privkey) in test_privkeys.iter().enumerate() {
-            let cpu_pubkey = pubkey_from_privkey(privkey)
-                .expect("CPU pubkey derivation failed");
+            let cpu_pubkey = pubkey_from_privkey(privkey).expect("CPU pubkey derivation failed");
 
             let gpu_pubkey = &gpu_pubkeys[i * 33..(i + 1) * 33];
 
             assert_eq!(
-                cpu_pubkey.as_slice(), gpu_pubkey,
+                cpu_pubkey.as_slice(),
+                gpu_pubkey,
                 "Pubkey mismatch for test vector {i}!\n  privkey: {}\n  CPU: {}\n  GPU: {}",
                 hex::encode(privkey),
                 hex::encode(cpu_pubkey),
@@ -791,14 +828,18 @@ mod tests {
             let gpu_hash = &gpu_hashes[i * 20..(i + 1) * 20];
 
             assert_eq!(
-                cpu_hash.as_slice(), gpu_hash,
+                cpu_hash.as_slice(),
+                gpu_hash,
                 "Hash mismatch for test vector {i}!\n  CPU: {}\n  GPU: {}",
                 hex::encode(cpu_hash),
                 hex::encode(gpu_hash),
             );
         }
 
-        eprintln!("✅ All {} GPU secp256k1 test vectors matched CPU!", test_privkeys.len());
+        eprintln!(
+            "✅ All {} GPU secp256k1 test vectors matched CPU!",
+            test_privkeys.len()
+        );
     }
 
     /// Test GPU mnemonic pipeline against known test vector.
@@ -824,7 +865,8 @@ mod tests {
             return;
         }
 
-        let mnemonic = "monster asthma shaft average main office dial since rural guitar estate sight";
+        let mnemonic =
+            "monster asthma shaft average main office dial since rural guitar estate sight";
         let mnemonic_bytes = mnemonic.as_bytes();
         let mnemonic_len = mnemonic_bytes.len() as u32;
 
@@ -840,13 +882,16 @@ mod tests {
         let cpu_key = cosmos_vanity_keyderiv::derive_keypair_from_mnemonic(
             mnemonic,
             cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH,
-        ).unwrap();
-        let cpu_addr = cosmos_vanity_address::pubkey_to_bech32(cpu_key.public_key_bytes(), "cosmos").unwrap();
+        )
+        .unwrap();
+        let cpu_addr =
+            cosmos_vanity_address::pubkey_to_bech32(cpu_key.public_key_bytes(), "cosmos").unwrap();
 
         // GPU derived privkey should match CPU
         let gpu_privkey = &privkeys[..32];
         assert_eq!(
-            cpu_key.secret_key_bytes(), gpu_privkey,
+            cpu_key.secret_key_bytes(),
+            gpu_privkey,
             "Private key mismatch!\n  CPU: {}\n  GPU: {}",
             hex::encode(cpu_key.secret_key_bytes()),
             hex::encode(gpu_privkey),
@@ -873,40 +918,66 @@ mod diagnostic_tests {
     use super::*;
     use ocl::{Buffer, Kernel};
 
-    fn get_mnemonic_program() -> (GpuContext, ocl::Program) {
-        let ctx = GpuContext::new().expect("No GPU");
-        assert!(ctx.has_mnemonic_kernel(), "No mnemonic kernel");
-        // Re-build the mnemonic program for our diagnostic kernels
-        let prog = ctx.mnemonic_program.as_ref().unwrap().clone();
-        (ctx, prog)
+    fn get_mnemonic_program() -> Option<(GpuContext, ocl::Program)> {
+        if !is_available() {
+            eprintln!("No OpenCL GPU available, skipping diagnostic test");
+            return None;
+        }
+
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                eprintln!("Could not initialize OpenCL backend: {err}, skipping");
+                return None;
+            }
+        };
+
+        if !ctx.has_mnemonic_kernel() {
+            eprintln!("OpenCL mnemonic kernel not available, skipping diagnostic test");
+            return None;
+        }
+
+        let prog = ctx.mnemonic_program.as_ref()?.clone();
+        Some((ctx, prog))
     }
 
     #[test]
     fn test_gpu_sha512() {
-        let ctx = GpuContext::new().expect("No GPU");
-        if !ctx.has_mnemonic_kernel() { return; }
-        let prog = ctx.mnemonic_program.as_ref().unwrap();
+        let Some((ctx, prog)) = get_mnemonic_program() else {
+            return;
+        };
 
         // Test vector: SHA-512("abc")
         let input = b"abc";
         let expected = "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f";
 
         let input_buf = Buffer::<u8>::builder()
-            .queue(ctx.queue.clone()).len(input.len()).copy_host_slice(input).build().unwrap();
+            .queue(ctx.queue.clone())
+            .len(input.len())
+            .copy_host_slice(input)
+            .build()
+            .unwrap();
         let output_buf = Buffer::<u8>::builder()
-            .queue(ctx.queue.clone()).len(64).fill_val(0u8).build().unwrap();
+            .queue(ctx.queue.clone())
+            .len(64)
+            .fill_val(0u8)
+            .build()
+            .unwrap();
 
         let kernel = Kernel::builder()
-            .program(prog)
+            .program(&prog)
             .name("test_sha512_kernel")
             .queue(ctx.queue.clone())
             .global_work_size(1)
             .arg(&input_buf)
             .arg(input.len() as u32)
             .arg(&output_buf)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
-        unsafe { kernel.enq().unwrap(); }
+        unsafe {
+            kernel.enq().unwrap();
+        }
         let mut result = vec![0u8; 64];
         output_buf.read(&mut result).enq().unwrap();
 
@@ -918,28 +989,40 @@ mod diagnostic_tests {
 
     #[test]
     fn test_gpu_hmac_sha512() {
-        let ctx = GpuContext::new().expect("No GPU");
-        if !ctx.has_mnemonic_kernel() { return; }
-        let prog = ctx.mnemonic_program.as_ref().unwrap();
+        let Some((ctx, prog)) = get_mnemonic_program() else {
+            return;
+        };
 
         // Test: HMAC-SHA512(key="Bitcoin seed", data=known_seed)
         let key = b"Bitcoin seed";
         let seed_hex = "e2fcb5bec6933a405806d6e8461a562036d584fe55958e13f4705014c936f716db0009b8558ad35cd7d023d043b0c51bbb9a4dc810addd4cfbb4604115224dd8";
         let seed = hex::decode(seed_hex).unwrap();
-        
+
         // Expected master key from CPU
         let expected_il = "4ce7e11819686786a7a01310c3b5e9c7257d724253525d4502840a7abac0e2c7";
         let expected_ir = "9930a92a22307366bc88347a037a203fe4ce27858c68cff91195c24dcd6aef14";
 
         let key_buf = Buffer::<u8>::builder()
-            .queue(ctx.queue.clone()).len(key.len()).copy_host_slice(key).build().unwrap();
+            .queue(ctx.queue.clone())
+            .len(key.len())
+            .copy_host_slice(key)
+            .build()
+            .unwrap();
         let msg_buf = Buffer::<u8>::builder()
-            .queue(ctx.queue.clone()).len(seed.len()).copy_host_slice(&seed).build().unwrap();
+            .queue(ctx.queue.clone())
+            .len(seed.len())
+            .copy_host_slice(&seed)
+            .build()
+            .unwrap();
         let output_buf = Buffer::<u8>::builder()
-            .queue(ctx.queue.clone()).len(64).fill_val(0u8).build().unwrap();
+            .queue(ctx.queue.clone())
+            .len(64)
+            .fill_val(0u8)
+            .build()
+            .unwrap();
 
         let kernel = Kernel::builder()
-            .program(prog)
+            .program(&prog)
             .name("test_hmac_sha512_kernel")
             .queue(ctx.queue.clone())
             .global_work_size(1)
@@ -948,9 +1031,12 @@ mod diagnostic_tests {
             .arg(&msg_buf)
             .arg(seed.len() as u32)
             .arg(&output_buf)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
-        unsafe { kernel.enq().unwrap(); }
+        unsafe {
+            kernel.enq().unwrap();
+        }
         let mut result = vec![0u8; 64];
         output_buf.read(&mut result).enq().unwrap();
 
@@ -963,13 +1049,31 @@ mod diagnostic_tests {
         eprintln!("✅ HMAC-SHA512 test passed");
     }
 
-    fn run_pbkdf2_test(ctx: &GpuContext, prog: &ocl::Program, password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
+    fn run_pbkdf2_test(
+        ctx: &GpuContext,
+        prog: &ocl::Program,
+        password: &[u8],
+        salt: &[u8],
+        iterations: u32,
+    ) -> Vec<u8> {
         let pw_buf = Buffer::<u8>::builder()
-            .queue(ctx.queue.clone()).len(password.len()).copy_host_slice(password).build().unwrap();
+            .queue(ctx.queue.clone())
+            .len(password.len())
+            .copy_host_slice(password)
+            .build()
+            .unwrap();
         let salt_buf = Buffer::<u8>::builder()
-            .queue(ctx.queue.clone()).len(salt.len()).copy_host_slice(salt).build().unwrap();
+            .queue(ctx.queue.clone())
+            .len(salt.len())
+            .copy_host_slice(salt)
+            .build()
+            .unwrap();
         let output_buf = Buffer::<u8>::builder()
-            .queue(ctx.queue.clone()).len(64).fill_val(0u8).build().unwrap();
+            .queue(ctx.queue.clone())
+            .len(64)
+            .fill_val(0u8)
+            .build()
+            .unwrap();
 
         let kernel = Kernel::builder()
             .program(prog)
@@ -982,9 +1086,12 @@ mod diagnostic_tests {
             .arg(salt.len() as u32)
             .arg(iterations)
             .arg(&output_buf)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
-        unsafe { kernel.enq().unwrap(); }
+        unsafe {
+            kernel.enq().unwrap();
+        }
         let mut result = vec![0u8; 64];
         output_buf.read(&mut result).enq().unwrap();
         result
@@ -992,22 +1099,23 @@ mod diagnostic_tests {
 
     #[test]
     fn test_gpu_pbkdf2() {
-        let ctx = GpuContext::new().expect("No GPU");
-        if !ctx.has_mnemonic_kernel() { return; }
-        let prog = ctx.mnemonic_program.as_ref().unwrap();
+        let Some((ctx, prog)) = get_mnemonic_program() else {
+            return;
+        };
 
-        let mnemonic = b"monster asthma shaft average main office dial since rural guitar estate sight";
+        let mnemonic =
+            b"monster asthma shaft average main office dial since rural guitar estate sight";
         let salt = b"mnemonic";
 
         // Test with 1 iteration first
         let expected_1 = "4d61edadb848eb918ab4044174a7fd0a54d396ab3de52e0144793f17b6028f182a0690848144070756018101c51d3ef36ef19342e8c0b5d771ccacc5f31ecfb6";
-        let result_1 = run_pbkdf2_test(&ctx, prog, mnemonic, salt, 1);
+        let result_1 = run_pbkdf2_test(&ctx, &prog, mnemonic, salt, 1);
         eprintln!("GPU PBKDF2 1-iter: {}", hex::encode(&result_1));
         eprintln!("Expected 1-iter:   {}", expected_1);
-        
+
         // Test with 2 iterations
         let expected_2 = "e4bed65f7fa4bfcba9ded26de4d81089a853feb2e80260a9ee41615b7b2d70147273b8fae564639371eaaf8dd2502ae01518678b711a37cc57ff10c52964ee7f";
-        let result_2 = run_pbkdf2_test(&ctx, prog, mnemonic, salt, 2);
+        let result_2 = run_pbkdf2_test(&ctx, &prog, mnemonic, salt, 2);
         eprintln!("GPU PBKDF2 2-iter: {}", hex::encode(&result_2));
         eprintln!("Expected 2-iter:   {}", expected_2);
 
@@ -1016,16 +1124,28 @@ mod diagnostic_tests {
             let test_key = vec![0x41u8; 76]; // 'A' * 76
             let test_msg = vec![0x42u8; 12]; // 'B' * 12
             let expected_hmac = "aec0594990ee8164428b606233d47d68f553f7a4c15b4bbfe97bb46d8e15be73f89e2785f637b0d20351a9bb784d070b2cc03a9e19ddcdc109fe40201eddba19";
-            
+
             let key_buf = Buffer::<u8>::builder()
-                .queue(ctx.queue.clone()).len(76).copy_host_slice(&test_key).build().unwrap();
+                .queue(ctx.queue.clone())
+                .len(76)
+                .copy_host_slice(&test_key)
+                .build()
+                .unwrap();
             let msg_buf = Buffer::<u8>::builder()
-                .queue(ctx.queue.clone()).len(12).copy_host_slice(&test_msg).build().unwrap();
+                .queue(ctx.queue.clone())
+                .len(12)
+                .copy_host_slice(&test_msg)
+                .build()
+                .unwrap();
             let out_buf = Buffer::<u8>::builder()
-                .queue(ctx.queue.clone()).len(64).fill_val(0u8).build().unwrap();
-            
+                .queue(ctx.queue.clone())
+                .len(64)
+                .fill_val(0u8)
+                .build()
+                .unwrap();
+
             let k = Kernel::builder()
-                .program(prog)
+                .program(&prog)
                 .name("test_hmac_sha512_kernel")
                 .queue(ctx.queue.clone())
                 .global_work_size(1)
@@ -1034,28 +1154,51 @@ mod diagnostic_tests {
                 .arg(&msg_buf)
                 .arg(12u32)
                 .arg(&out_buf)
-                .build().unwrap();
-            unsafe { k.enq().unwrap(); }
+                .build()
+                .unwrap();
+            unsafe {
+                k.enq().unwrap();
+            }
             let mut hmac_result = vec![0u8; 64];
             out_buf.read(&mut hmac_result).enq().unwrap();
             eprintln!("GPU HMAC(A*76, B*12): {}", hex::encode(&hmac_result));
             eprintln!("Expected:             {}", expected_hmac);
-            assert_eq!(hex::encode(&hmac_result), expected_hmac, "HMAC 76-byte key test failed!");
+            assert_eq!(
+                hex::encode(&hmac_result),
+                expected_hmac,
+                "HMAC 76-byte key test failed!"
+            );
             eprintln!("✅ HMAC 76-byte key test passed");
         }
 
         // Also test HMAC directly with same inputs as PBKDF2 U1
         {
-            let salt_ext: Vec<u8> = salt.iter().copied().chain([0, 0, 0, 1].iter().copied()).collect();
+            let salt_ext: Vec<u8> = salt
+                .iter()
+                .copied()
+                .chain([0, 0, 0, 1].iter().copied())
+                .collect();
             let key_buf = Buffer::<u8>::builder()
-                .queue(ctx.queue.clone()).len(mnemonic.len()).copy_host_slice(mnemonic).build().unwrap();
+                .queue(ctx.queue.clone())
+                .len(mnemonic.len())
+                .copy_host_slice(mnemonic)
+                .build()
+                .unwrap();
             let msg_buf = Buffer::<u8>::builder()
-                .queue(ctx.queue.clone()).len(salt_ext.len()).copy_host_slice(&salt_ext).build().unwrap();
+                .queue(ctx.queue.clone())
+                .len(salt_ext.len())
+                .copy_host_slice(&salt_ext)
+                .build()
+                .unwrap();
             let out_buf = Buffer::<u8>::builder()
-                .queue(ctx.queue.clone()).len(64).fill_val(0u8).build().unwrap();
+                .queue(ctx.queue.clone())
+                .len(64)
+                .fill_val(0u8)
+                .build()
+                .unwrap();
 
             let k = Kernel::builder()
-                .program(prog)
+                .program(&prog)
                 .name("test_hmac_sha512_kernel")
                 .queue(ctx.queue.clone())
                 .global_work_size(1)
@@ -1064,32 +1207,54 @@ mod diagnostic_tests {
                 .arg(&msg_buf)
                 .arg(salt_ext.len() as u32)
                 .arg(&out_buf)
-                .build().unwrap();
-            unsafe { k.enq().unwrap(); }
+                .build()
+                .unwrap();
+            unsafe {
+                k.enq().unwrap();
+            }
             let mut hmac_result = vec![0u8; 64];
             out_buf.read(&mut hmac_result).enq().unwrap();
-            eprintln!("GPU direct HMAC(mnemonic, salt||1): {}", hex::encode(&hmac_result));
+            eprintln!(
+                "GPU direct HMAC(mnemonic, salt||1): {}",
+                hex::encode(&hmac_result)
+            );
             eprintln!("Expected:                            {}", expected_1);
-            assert_eq!(hex::encode(&hmac_result), expected_1, "Direct HMAC for U1 mismatch - pointer issue!");
+            assert_eq!(
+                hex::encode(&hmac_result),
+                expected_1,
+                "Direct HMAC for U1 mismatch - pointer issue!"
+            );
         }
 
-        assert_eq!(hex::encode(&result_1), expected_1, "PBKDF2 1-iter mismatch!");
-        assert_eq!(hex::encode(&result_2), expected_2, "PBKDF2 2-iter mismatch!");
-        
+        assert_eq!(
+            hex::encode(&result_1),
+            expected_1,
+            "PBKDF2 1-iter mismatch!"
+        );
+        assert_eq!(
+            hex::encode(&result_2),
+            expected_2,
+            "PBKDF2 2-iter mismatch!"
+        );
+
         // Full 2048 iterations
         let expected_seed = "e2fcb5bec6933a405806d6e8461a562036d584fe55958e13f4705014c936f716db0009b8558ad35cd7d023d043b0c51bbb9a4dc810addd4cfbb4604115224dd8";
-        let result = run_pbkdf2_test(&ctx, prog, mnemonic, salt, 2048);
+        let result = run_pbkdf2_test(&ctx, &prog, mnemonic, salt, 2048);
         eprintln!("GPU PBKDF2 2048:   {}", hex::encode(&result));
         eprintln!("Expected 2048:     {}", expected_seed);
-        assert_eq!(hex::encode(&result), expected_seed, "PBKDF2 2048-iter mismatch!");
+        assert_eq!(
+            hex::encode(&result),
+            expected_seed,
+            "PBKDF2 2048-iter mismatch!"
+        );
         eprintln!("✅ PBKDF2 test passed");
     }
 
     #[test]
     fn test_gpu_bip32() {
-        let ctx = GpuContext::new().expect("No GPU");
-        if !ctx.has_mnemonic_kernel() { return; }
-        let prog = ctx.mnemonic_program.as_ref().unwrap();
+        let Some((ctx, prog)) = get_mnemonic_program() else {
+            return;
+        };
 
         let seed_hex = "e2fcb5bec6933a405806d6e8461a562036d584fe55958e13f4705014c936f716db0009b8558ad35cd7d023d043b0c51bbb9a4dc810addd4cfbb4604115224dd8";
         let seed = hex::decode(seed_hex).unwrap();
@@ -1104,27 +1269,38 @@ mod diagnostic_tests {
         ];
 
         let seed_buf = Buffer::<u8>::builder()
-            .queue(ctx.queue.clone()).len(64).copy_host_slice(&seed).build().unwrap();
+            .queue(ctx.queue.clone())
+            .len(64)
+            .copy_host_slice(&seed)
+            .build()
+            .unwrap();
         let output_buf = Buffer::<u8>::builder()
-            .queue(ctx.queue.clone()).len(32 * 6).fill_val(0u8).build().unwrap();
+            .queue(ctx.queue.clone())
+            .len(32 * 6)
+            .fill_val(0u8)
+            .build()
+            .unwrap();
 
         let kernel = Kernel::builder()
-            .program(prog)
+            .program(&prog)
             .name("test_bip32_kernel")
             .queue(ctx.queue.clone())
             .global_work_size(1)
             .arg(&seed_buf)
             .arg(&output_buf)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
-        unsafe { kernel.enq().unwrap(); }
+        unsafe {
+            kernel.enq().unwrap();
+        }
         let mut result = vec![0u8; 32 * 6];
         output_buf.read(&mut result).enq().unwrap();
 
         let names = ["master", "44'", "118'", "0'", "0 (change)", "0 (index)"];
         let mut all_ok = true;
         for (i, (name, exp)) in names.iter().zip(expected_keys.iter()).enumerate() {
-            let got = hex::encode(&result[i*32..(i+1)*32]);
+            let got = hex::encode(&result[i * 32..(i + 1) * 32]);
             let ok = got == *exp;
             eprintln!("{} {} key: {}", if ok { "✅" } else { "❌" }, name, got);
             if !ok {

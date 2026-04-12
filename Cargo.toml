@@ -34,6 +34,7 @@ bech32 = "0.11"
 
 # GPU
 ocl = "0.19"
+cudarc = { version = "0.19.4", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-11080"] }
 
 # CLI & IO
 clap = { version = "4", features = ["derive"] }
@@ -65,3 +66,8 @@ regex-lite = "0.1"
 
 # Testing & Benchmarks
 criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

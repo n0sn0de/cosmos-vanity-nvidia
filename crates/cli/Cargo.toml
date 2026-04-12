@@ -3,7 +3,7 @@ name = "cosmos-vanity-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI interface for Cosmos vanity address generation with AMD GPU acceleration"
+description = "CLI for Cosmos vanity address generation with OpenCL and CUDA GPU acceleration"
 
 [[bin]]
 name = "cosmos-vanity"
@@ -12,6 +12,7 @@ path = "src/main.rs"
 [features]
 default = []
 opencl = ["cosmos-vanity-gpu/opencl"]
+cuda = ["cosmos-vanity-gpu/cuda"]
 
 [dependencies]
 cosmos-vanity-keyderiv = { workspace = true }
