@@ -20,6 +20,14 @@ typedef struct { uint256_t x, y, z; } point_jacobian;
 // ---- Affine point (x, y) ----
 typedef struct { uint256_t x, y; } point_affine;
 
+// Windows CUDA uses 32-bit `long`, while OpenCL `long` is 64-bit.
+// Keep signed 64-bit arithmetic explicit so borrow/carry math is stable across toolchains.
+#ifdef __CUDACC__
+typedef long long slong;
+#else
+typedef long slong;
+#endif
+
 // ---- secp256k1 field prime p ----
 // p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
 // In little-endian limbs: d[0] = least significant
@@ -111,9 +119,9 @@ uint256_t field_add(uint256_t a, uint256_t b) {
 // a - b mod p
 uint256_t field_sub(uint256_t a, uint256_t b) {
     uint256_t r;
-    long borrow = 0;
+    slong borrow = 0;
     for (int i = 0; i < 8; i++) {
-        long s = (long)(ulong)a.d[i] - (long)(ulong)b.d[i] - borrow;
+        slong s = (slong)(ulong)a.d[i] - (slong)(ulong)b.d[i] - borrow;
         r.d[i] = (uint)s;
         borrow = (s < 0) ? 1 : 0;
     }

@@ -27,6 +27,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 num_cpus = { workspace = true }
 zeroize = { workspace = true }
+libloading = { workspace = true }
 
 hex = { workspace = true }
 

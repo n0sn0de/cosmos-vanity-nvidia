@@ -159,7 +159,7 @@ void sha512_final(sha512_ctx *ctx, uchar *digest) {
     while (ctx->buflen < 112)
         ctx->buf[ctx->buflen++] = 0;
 
-    // Length in bits (big-endian, 128-bit — we only use lower 64 bits)
+    // Length in bits (big-endian, 128-bit - we only use lower 64 bits)
     ulong bitlen = ctx->total * 8;
     for (int i = 0; i < 8; i++)
         ctx->buf[112 + i] = 0;
@@ -297,57 +297,55 @@ void pbkdf2_sha512(const uchar *password, uint password_len,
 
 // ============================= BIP-32 ======================================
 
-// secp256k1 curve order n (for modular addition of child keys)
-__constant uint SECP256K1_N[8] = {
-    0xD0364141, 0xBFD25E8C, 0xAF48A03B, 0xBAAEDCE6,
-    0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
+// secp256k1 curve order n (for modular addition of child keys), big-endian bytes.
+__constant uchar SECP256K1_N_BYTES[32] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+    0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41
 };
 
 // Add two 256-bit numbers mod n (for BIP-32 child key derivation)
 // a and b are big-endian 32-byte arrays, result in out (big-endian)
 void add_privkeys_mod_n(const uchar *a, const uchar *b, uchar *out) {
-    // Convert to little-endian limbs for easier arithmetic
-    uint al[8], bl[8], rl[8];
-    for (int i = 0; i < 8; i++) {
-        al[i] = ((uint)a[31 - i*4] | ((uint)a[30 - i*4] << 8) |
-                 ((uint)a[29 - i*4] << 16) | ((uint)a[28 - i*4] << 24));
-        bl[i] = ((uint)b[31 - i*4] | ((uint)b[30 - i*4] << 8) |
-                 ((uint)b[29 - i*4] << 16) | ((uint)b[28 - i*4] << 24));
+    uchar sum[32];
+    uint carry = 0;
+
+    // Big-endian bytewise addition keeps behavior stable across toolchains.
+    for (int i = 31; i >= 0; i--) {
+        uint s = (uint)a[i] + (uint)b[i] + carry;
+        sum[i] = (uchar)s;
+        carry = s >> 8;
     }
 
-    // Add with carry
-    ulong carry = 0;
-    for (int i = 0; i < 8; i++) {
-        ulong sum = (ulong)al[i] + (ulong)bl[i] + carry;
-        rl[i] = (uint)sum;
-        carry = sum >> 32;
-    }
-
-    // Reduce mod n: if result >= n, subtract n
     int ge_n = (carry > 0) ? 1 : 0;
     if (!ge_n) {
-        // Compare rl >= SECP256K1_N
-        for (int i = 7; i >= 0; i--) {
-            if (rl[i] > SECP256K1_N[i]) { ge_n = 1; break; }
-            if (rl[i] < SECP256K1_N[i]) { break; }
+        for (int i = 0; i < 32; i++) {
+            if (sum[i] > SECP256K1_N_BYTES[i]) {
+                ge_n = 1;
+                break;
+            }
+            if (sum[i] < SECP256K1_N_BYTES[i]) {
+                ge_n = 0;
+                break;
+            }
         }
     }
 
     if (ge_n) {
-        ulong borrow = 0;
-        for (int i = 0; i < 8; i++) {
-            ulong diff = (ulong)rl[i] - (ulong)SECP256K1_N[i] - borrow;
-            rl[i] = (uint)diff;
-            borrow = (diff >> 63) & 1;
+        uint borrow = 0;
+        for (int i = 31; i >= 0; i--) {
+            uint subtrahend = (uint)SECP256K1_N_BYTES[i] + borrow;
+            if ((uint)sum[i] < subtrahend) {
+                out[i] = (uchar)(((uint)sum[i] + 256U) - subtrahend);
+                borrow = 1;
+            } else {
+                out[i] = (uchar)((uint)sum[i] - subtrahend);
+                borrow = 0;
+            }
         }
-    }
-
-    // Convert back to big-endian
-    for (int i = 0; i < 8; i++) {
-        out[31 - i*4]     = (uchar)(rl[i]);
-        out[30 - i*4] = (uchar)(rl[i] >> 8);
-        out[29 - i*4] = (uchar)(rl[i] >> 16);
-        out[28 - i*4] = (uchar)(rl[i] >> 24);
+    } else {
+        for (int i = 0; i < 32; i++) out[i] = sum[i];
     }
 }
 
@@ -370,7 +368,7 @@ void bip32_derive_child(const uchar *parent_key, const uchar *chain_code,
         data[36] = (uchar)(index);
         data_len = 37;
     } else {
-        // Need compressed pubkey — caller must provide it in parent_key slot
+        // Need compressed pubkey - caller must provide it in parent_key slot
         // For normal derivation, parent_key is actually the 33-byte compressed pubkey
         for (int i = 0; i < 33; i++) data[i] = parent_key[i];
         data[33] = (uchar)(index >> 24);
@@ -410,25 +408,21 @@ void bip32_derive_cosmos(const uchar *seed, uchar *out_privkey) {
         chain[i] = master[32 + i]; // chain code
     }
 
-    // Derive hardened children: 44', 118', 0'
-    uint hardened_indices[3] = { 0x8000002C, 0x80000076, 0x80000000 };
-    for (int level = 0; level < 3; level++) {
-        bip32_derive_child(key, chain, hardened_indices[level], 1, child_il, child_chain);
-        // child_key = (IL + parent_key) mod n
-        add_privkeys_mod_n(child_il, key, key);
-        for (int i = 0; i < 32; i++) chain[i] = child_chain[i];
-    }
+    // Derive hardened children explicitly: 44', 118', 0'
+    bip32_derive_child(key, chain, 0x8000002C, 1, child_il, child_chain);
+    add_privkeys_mod_n(child_il, key, key);
+    for (int i = 0; i < 32; i++) chain[i] = child_chain[i];
 
-    // Derive normal children: 0, 0
-    // Path indices for the two normal derivation levels (both are 0 for m/44'/118'/0'/0/0)
-    uint normal_indices[2] = { 0, 0 };
-    // For normal derivation, we need the compressed pubkey of the current key
+    bip32_derive_child(key, chain, 0x80000076, 1, child_il, child_chain);
+    add_privkeys_mod_n(child_il, key, key);
+    for (int i = 0; i < 32; i++) chain[i] = child_chain[i];
+
+    bip32_derive_child(key, chain, 0x80000000, 1, child_il, child_chain);
+    add_privkeys_mod_n(child_il, key, key);
+    for (int i = 0; i < 32; i++) chain[i] = child_chain[i];
+
+    // Derive normal children explicitly: 0, 0
     for (int level = 0; level < 2; level++) {
-        // Compute compressed pubkey from current private key using secp256k1
-        // We need to call scalar_mul_G and compress — these are defined in secp256k1.cl
-        // which is concatenated with this source
-
-        // Convert key from big-endian bytes to uint256_t
         uint256_t privkey_val;
         for (int i = 0; i < 8; i++) {
             privkey_val.d[i] = ((uint)key[31 - i*4]) |
@@ -438,8 +432,6 @@ void bip32_derive_cosmos(const uchar *seed, uchar *out_privkey) {
         }
 
         point_jacobian pub_jac = scalar_mul_G(privkey_val);
-
-        // Convert to affine and compress
         uint256_t z_inv = field_inv(pub_jac.z);
         uint256_t z_inv2 = field_sqr(z_inv);
         uint256_t z_inv3 = field_mul(z_inv2, z_inv);
@@ -455,8 +447,7 @@ void bip32_derive_cosmos(const uchar *seed, uchar *out_privkey) {
             compressed_pubkey[1 + (7-i)*4 + 3] = (uchar)(pub_x.d[i]);
         }
 
-        // Normal derivation uses compressed pubkey as "key" in HMAC data
-        bip32_derive_child(compressed_pubkey, chain, normal_indices[level], 0, child_il, child_chain);
+        bip32_derive_child(compressed_pubkey, chain, 0, 0, child_il, child_chain);
         add_privkeys_mod_n(child_il, key, key);
         for (int i = 0; i < 32; i++) chain[i] = child_chain[i];
     }
@@ -569,7 +560,7 @@ __kernel void test_sha512_kernel(
 ) {
     uchar local_input[256];
     for (uint i = 0; i < input_len; i++) local_input[i] = input[i];
-    
+
     uchar digest[64];
     sha512(local_input, input_len, digest);
     for (int i = 0; i < 64; i++) output[i] = digest[i];
@@ -587,7 +578,7 @@ __kernel void test_hmac_sha512_kernel(
     for (uint i = 0; i < key_len; i++) local_key[i] = key_in[i];
     uchar local_msg[256];
     for (uint i = 0; i < msg_len; i++) local_msg[i] = msg_in[i];
-    
+
     uchar out[64];
     hmac_sha512_priv(local_key, key_len, local_msg, msg_len, out);
     for (int i = 0; i < 64; i++) output[i] = out[i];
@@ -606,10 +597,53 @@ __kernel void test_pbkdf2_kernel(
     for (uint i = 0; i < password_len; i++) local_pw[i] = password[i];
     uchar local_salt[80];
     for (uint i = 0; i < salt_len; i++) local_salt[i] = salt[i];
-    
+
     uchar out[64];
     pbkdf2_sha512(local_pw, password_len, local_salt, salt_len, iterations, out);
     for (int i = 0; i < 64; i++) output[i] = out[i];
+}
+
+// Diagnostic: dump hardened BIP-32 intermediate values for debugging.
+// Output layout, each chunk is 32 bytes:
+// [0] master key, [1] master chain, [2] 44' IL, [3] 44' chain,
+// [4] 44' child key, [5] 118' IL, [6] 118' chain, [7] 118' child key.
+__kernel void test_bip32_hardened_debug_kernel(
+    __global const uchar *seed_in,
+    __global uchar *output
+) {
+    uchar seed[64];
+    for (int i = 0; i < 64; i++) seed[i] = seed_in[i];
+
+    uchar key[32], chain[32], child_il[32], child_chain[32];
+    uchar btc_seed[12] = {'B','i','t','c','o','i','n',' ','s','e','e','d'};
+    uchar master[64];
+    hmac_sha512_priv(btc_seed, 12, seed, 64, master);
+
+    for (int i = 0; i < 32; i++) {
+        key[i] = master[i];
+        chain[i] = master[32 + i];
+        output[i] = key[i];
+        output[32 + i] = chain[i];
+    }
+
+    bip32_derive_child(key, chain, 0x8000002C, 1, child_il, child_chain);
+    for (int i = 0; i < 32; i++) {
+        output[64 + i] = child_il[i];
+        output[96 + i] = child_chain[i];
+    }
+    add_privkeys_mod_n(child_il, key, key);
+    for (int i = 0; i < 32; i++) {
+        chain[i] = child_chain[i];
+        output[128 + i] = key[i];
+    }
+
+    bip32_derive_child(key, chain, 0x80000076, 1, child_il, child_chain);
+    for (int i = 0; i < 32; i++) {
+        output[160 + i] = child_il[i];
+        output[192 + i] = child_chain[i];
+    }
+    add_privkeys_mod_n(child_il, key, key);
+    for (int i = 0; i < 32; i++) output[224 + i] = key[i];
 }
 
 // Diagnostic: test BIP-32 derivation from known seed
@@ -619,34 +653,39 @@ __kernel void test_bip32_kernel(
 ) {
     uchar seed[64];
     for (int i = 0; i < 64; i++) seed[i] = seed_in[i];
-    
+
     uchar key[32], chain[32], child_il[32], child_chain[32];
-    
+
     // Master key
     uchar btc_seed[12] = {'B','i','t','c','o','i','n',' ','s','e','e','d'};
     uchar master[64];
     hmac_sha512_priv(btc_seed, 12, seed, 64, master);
-    
+
     for (int i = 0; i < 32; i++) {
         key[i] = master[i];
         chain[i] = master[32 + i];
     }
-    
+
     // Output master key
     for (int i = 0; i < 32; i++) output[i] = key[i];
-    
+
     // Hardened: 44', 118', 0'
-    uint hardened_indices[3] = { 0x8000002C, 0x80000076, 0x80000000 };
-    for (int level = 0; level < 3; level++) {
-        bip32_derive_child(key, chain, hardened_indices[level], 1, child_il, child_chain);
-        add_privkeys_mod_n(child_il, key, key);
-        for (int i = 0; i < 32; i++) chain[i] = child_chain[i];
-        // Output this level's key
-        for (int i = 0; i < 32; i++) output[32 + level*32 + i] = key[i];
-    }
-    
+    bip32_derive_child(key, chain, 0x8000002C, 1, child_il, child_chain);
+    add_privkeys_mod_n(child_il, key, key);
+    for (int i = 0; i < 32; i++) chain[i] = child_chain[i];
+    for (int i = 0; i < 32; i++) output[32 + i] = key[i];
+
+    bip32_derive_child(key, chain, 0x80000076, 1, child_il, child_chain);
+    add_privkeys_mod_n(child_il, key, key);
+    for (int i = 0; i < 32; i++) chain[i] = child_chain[i];
+    for (int i = 0; i < 32; i++) output[64 + i] = key[i];
+
+    bip32_derive_child(key, chain, 0x80000000, 1, child_il, child_chain);
+    add_privkeys_mod_n(child_il, key, key);
+    for (int i = 0; i < 32; i++) chain[i] = child_chain[i];
+    for (int i = 0; i < 32; i++) output[96 + i] = key[i];
+
     // Normal: 0, 0
-    uint normal_indices[2] = { 0, 0 };
     for (int level = 0; level < 2; level++) {
         uint256_t privkey_val;
         for (int i = 0; i < 8; i++) {
@@ -661,7 +700,7 @@ __kernel void test_bip32_kernel(
         uint256_t z_inv3 = field_mul(z_inv2, z_inv);
         uint256_t pub_x = field_mul(pub_jac.x, z_inv2);
         uint256_t pub_y = field_mul(pub_jac.y, z_inv3);
-        
+
         uchar compressed_pubkey[33];
         compressed_pubkey[0] = (pub_y.d[0] & 1) ? 0x03 : 0x02;
         for (int i = 7; i >= 0; i--) {
@@ -670,11 +709,10 @@ __kernel void test_bip32_kernel(
             compressed_pubkey[1 + (7-i)*4 + 2] = (uchar)(pub_x.d[i] >> 8);
             compressed_pubkey[1 + (7-i)*4 + 3] = (uchar)(pub_x.d[i]);
         }
-        
-        bip32_derive_child(compressed_pubkey, chain, normal_indices[level], 0, child_il, child_chain);
+
+        bip32_derive_child(compressed_pubkey, chain, 0, 0, child_il, child_chain);
         add_privkeys_mod_n(child_il, key, key);
         for (int i = 0; i < 32; i++) chain[i] = child_chain[i];
-        // Output this level's key (levels 3 and 4)
         for (int i = 0; i < 32; i++) output[32 + (3+level)*32 + i] = key[i];
     }
 }
