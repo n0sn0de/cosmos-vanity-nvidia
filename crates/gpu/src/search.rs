@@ -7,6 +7,8 @@ use std::time::Instant;
 
 use chrono::Utc;
 use crossbeam_channel::{bounded, Receiver};
+#[cfg(any(feature = "opencl", feature = "cuda"))]
+use zeroize::Zeroize;
 
 #[cfg(any(feature = "opencl", feature = "cuda"))]
 use cosmos_vanity_address::encode_bech32;
@@ -542,7 +544,7 @@ impl VanitySearcher {
                     }
 
                     pubkeys_flat.clear();
-                    mnemonics.clear();
+                    zeroize_string_vec(&mut mnemonics);
                     paths.clear();
 
                     match keygen_rx.recv() {
@@ -1094,17 +1096,20 @@ impl VanitySearcher {
                     }
 
                     // Fill batch
+                    batch_mnemonics_flat.zeroize();
                     batch_mnemonics_flat.clear();
                     batch_lens.clear();
-                    batch_strings.clear();
+                    zeroize_string_vec(&mut batch_strings);
 
                     // Block on first item
                     match mnem_rx.recv() {
-                        Ok((bytes, string)) => {
+                        Ok((mut bytes, string)) => {
                             let mut padded = vec![0u8; 256];
                             let len = bytes.len().min(256);
                             padded[..len].copy_from_slice(&bytes[..len]);
                             batch_mnemonics_flat.extend_from_slice(&padded);
+                            bytes.zeroize();
+                            padded.zeroize();
                             batch_lens.push(len as u32);
                             batch_strings.push(string);
                         }
@@ -1114,11 +1119,13 @@ impl VanitySearcher {
                     // Drain up to batch_size
                     while batch_lens.len() < batch_size {
                         match mnem_rx.try_recv() {
-                            Ok((bytes, string)) => {
+                            Ok((mut bytes, string)) => {
                                 let mut padded = vec![0u8; 256];
                                 let len = bytes.len().min(256);
                                 padded[..len].copy_from_slice(&bytes[..len]);
                                 batch_mnemonics_flat.extend_from_slice(&padded);
+                                bytes.zeroize();
+                                padded.zeroize();
                                 batch_lens.push(len as u32);
                                 batch_strings.push(string);
                             }
@@ -1132,7 +1139,7 @@ impl VanitySearcher {
                     }
 
                     // Dispatch to GPU
-                    let (privkeys, hashes, _matches) =
+                    let (mut privkeys, hashes, _matches) =
                         match gpu_ctx.mnemonic_batch(&batch_mnemonics_flat, &batch_lens) {
                             Ok(r) => r,
                             Err(e) => {
@@ -1171,14 +1178,17 @@ impl VanitySearcher {
                                 derivation_path: "m/44'/118'/0'/0/0".to_string(),
                                 candidate_number: candidate_num,
                                 elapsed_secs: elapsed,
-                                private_key_hex: Some(hex::encode(&privkeys[i * 32..(i + 1) * 32])),
+                                private_key_hex: None,
                             };
 
                             if result_tx.send(result).is_err() {
+                                privkeys.zeroize();
                                 return;
                             }
                         }
                     }
+
+                    privkeys.zeroize();
                 }
             })?;
 
@@ -1217,9 +1227,17 @@ impl KeyBatch {
 
     fn clear(&mut self) {
         self.pubkeys.clear();
-        self.mnemonics.clear();
+        zeroize_string_vec(&mut self.mnemonics);
         self.paths.clear();
     }
+}
+
+#[cfg(any(feature = "opencl", feature = "cuda"))]
+fn zeroize_string_vec(values: &mut Vec<String>) {
+    for value in values.iter_mut() {
+        value.zeroize();
+    }
+    values.clear();
 }
 
 /// Fill a batch buffer from the keygen channel.

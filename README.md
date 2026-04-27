@@ -108,14 +108,20 @@ If the binary logs `nvcc fatal   : Cannot find compiler 'cl.exe' in PATH` while 
 ## Usage
 
 ```bash
-# force CUDA on NVIDIA
-cosmos-vanity search -p abc --gpu-api cuda
+# force CUDA raw mode on NVIDIA
+cosmos-vanity search -p abc --gpu-api cuda -m gpu -k raw
 
 # full mnemonic pipeline on CUDA
-cosmos-vanity search -p abc --gpu-api cuda -k mnemonic -w 12
+cosmos-vanity search -p abc --gpu-api cuda -m gpu -k mnemonic -w 12
 
-# CPU only
+# CPU only mnemonic mode
 cosmos-vanity search -p abc -m cpu -k mnemonic
+
+# verify without putting the mnemonic in argv/shell history
+cosmos-vanity verify --mnemonic-file ./mnemonic.txt --address cosmos1...
+
+# opt into printing wallet secrets to stdout (unsafe)
+cosmos-vanity generate --unsafe-print-secrets
 ```
 
 ## Validation commands
@@ -139,9 +145,12 @@ target\release\cosmos-vanity.exe search -p n0s --gpu-api cuda -m gpu --format js
 
 ## Security notes
 
-- mnemonic or private key output gives full wallet control
-- every reported match is verified again on CPU before output
-- `zeroize` is used for sensitive material where practical
+- mnemonic/private-key output is redacted by default; `--unsafe-print-secrets` is required to print wallet secrets to stdout
+- `verify --mnemonic-file <path>` avoids putting mnemonics in argv/shell history; legacy `--mnemonic` still works but is hidden and warns
+- raw key mode is only allowed on the pure GPU raw path; CPU, hybrid, and GPU fallback paths must use mnemonic mode
+- every reported match is verified again on CPU before output; failed verification results are skipped, not counted
+- mnemonic word count is restricted to 12 or 24 words
+- `zeroize` is used for sensitive material where practical, including additional cleanup for GPU mnemonic host buffers
 - GPU VRAM can retain sensitive data after execution, so production key generation should be treated accordingly
 
 ## License

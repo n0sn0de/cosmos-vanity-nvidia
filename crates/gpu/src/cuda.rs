@@ -1052,7 +1052,9 @@ mod tests {
                 .launch(single_thread_launch())
                 .expect("launch HMAC diagnostic kernel");
         }
-        ctx.stream.synchronize().expect("sync HMAC diagnostic kernel");
+        ctx.stream
+            .synchronize()
+            .expect("sync HMAC diagnostic kernel");
         ctx.stream
             .clone_dtoh(&output_buf)
             .expect("dtoh HMAC diagnostic kernel")
@@ -1087,7 +1089,9 @@ mod tests {
                 .launch(single_thread_launch())
                 .expect("launch PBKDF2 diagnostic kernel");
         }
-        ctx.stream.synchronize().expect("sync PBKDF2 diagnostic kernel");
+        ctx.stream
+            .synchronize()
+            .expect("sync PBKDF2 diagnostic kernel");
         ctx.stream
             .clone_dtoh(&output_buf)
             .expect("dtoh PBKDF2 diagnostic kernel")
@@ -1112,7 +1116,9 @@ mod tests {
                 .launch(single_thread_launch())
                 .expect("launch BIP32 diagnostic kernel");
         }
-        ctx.stream.synchronize().expect("sync BIP32 diagnostic kernel");
+        ctx.stream
+            .synchronize()
+            .expect("sync BIP32 diagnostic kernel");
         ctx.stream
             .clone_dtoh(&output_buf)
             .expect("dtoh BIP32 diagnostic kernel")
@@ -1239,22 +1245,18 @@ mod tests {
             return;
         };
 
-        let master_key = hex::decode(
-            "4ce7e11819686786a7a01310c3b5e9c7257d724253525d4502840a7abac0e2c7",
-        )
-        .unwrap();
-        let master_chain = hex::decode(
-            "9930a92a22307366bc88347a037a203fe4ce27858c68cff91195c24dcd6aef14",
-        )
-        .unwrap();
-        let child_44_key = hex::decode(
-            "b47ebdd2866a6deabadb573fae5da2760fe6dd7ac5b71a8246e77cfdd375a7d1",
-        )
-        .unwrap();
-        let child_44_chain = hex::decode(
-            "9972f653ca638e6c053e04530d93d7edaf2ae5745dfc1613877649b3d5dee3dd",
-        )
-        .unwrap();
+        let master_key =
+            hex::decode("4ce7e11819686786a7a01310c3b5e9c7257d724253525d4502840a7abac0e2c7")
+                .unwrap();
+        let master_chain =
+            hex::decode("9930a92a22307366bc88347a037a203fe4ce27858c68cff91195c24dcd6aef14")
+                .unwrap();
+        let child_44_key =
+            hex::decode("b47ebdd2866a6deabadb573fae5da2760fe6dd7ac5b71a8246e77cfdd375a7d1")
+                .unwrap();
+        let child_44_chain =
+            hex::decode("9972f653ca638e6c053e04530d93d7edaf2ae5745dfc1613877649b3d5dee3dd")
+                .unwrap();
 
         let mut msg_44 = vec![0u8; 37];
         msg_44[1..33].copy_from_slice(&master_key);
@@ -1330,7 +1332,10 @@ mod tests {
 
         for (i, expected_hex) in expected.iter().enumerate() {
             let got = hex::encode(&result[i * 32..(i + 1) * 32]);
-            assert_eq!(got, *expected_hex, "cuda BIP32 hardened debug mismatch at chunk {i}");
+            assert_eq!(
+                got, *expected_hex,
+                "cuda BIP32 hardened debug mismatch at chunk {i}"
+            );
         }
     }
 
@@ -1354,7 +1359,10 @@ mod tests {
         let result = run_cuda_bip32_test(&ctx, &seed);
         for (i, expected) in expected_keys.iter().enumerate() {
             let got = hex::encode(&result[i * 32..(i + 1) * 32]);
-            assert_eq!(got, *expected, "cuda BIP32 diagnostic mismatch at level {i}");
+            assert_eq!(
+                got, *expected,
+                "cuda BIP32 diagnostic mismatch at level {i}"
+            );
         }
     }
 
