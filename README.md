@@ -13,10 +13,11 @@ To keep the split pragmatic, the crate and binary names stay `cosmos-vanity-*` /
 | Linux | CPU | build/test validated | `cargo test --workspace --features cuda` passed locally |
 | Linux | CUDA | runtime-validated | `nosnode` (RTX 2070, driver `580.126.09`) found real `n0s` matches in raw and mnemonic modes with `"verified": true` |
 | Linux | OpenCL | inherited, not claimed here | retained from the split, but this repo is not the AMD/OpenCL support target |
-| Windows | CUDA | code present, not re-validated for this repo split | no runtime claim in this README |
+| Windows | CUDA | build-validated on native Windows | `win11` native `cargo build --release -p cosmos-vanity-cli --features cuda` passed on the RTX 3070 host, and `cosmos-vanity.exe --version` / `--help` succeeded |
 
 Notes:
 - I only claim runtime validation that was actually re-run for this repo split.
+- Windows runtime wallet-generation correctness was not re-validated in this pass, so this README still makes no Windows runtime safety claim.
 - The raw and mnemonic validation artifacts contained live secrets, so they were cleaned off the remote host after verification.
 
 ## Validation proof
