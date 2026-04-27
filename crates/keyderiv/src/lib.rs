@@ -36,6 +36,9 @@ pub enum KeyDerivError {
 
     #[error("invalid derivation path: {0}")]
     InvalidPath(String),
+
+    #[error("invalid mnemonic word count: {0} (expected 12 or 24)")]
+    InvalidWordCount(u8),
 }
 
 /// A derived keypair with its associated mnemonic and derivation path.
@@ -46,8 +49,7 @@ pub enum KeyDerivError {
 /// [`ZeroizeOnDrop`] to ensure secrets are cleared from memory when dropped.
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct DerivedKey {
-    /// The BIP-39 mnemonic phrase (24 words)
-    #[zeroize(skip)] // String doesn't impl Zeroize in the way we need; we handle manually
+    /// The BIP-39 mnemonic phrase.
     mnemonic_phrase: String,
 
     /// Raw seed bytes derived from the mnemonic
@@ -121,7 +123,11 @@ pub fn generate_random_keypair_with_words(
     path: &str,
     words: u8,
 ) -> Result<DerivedKey, KeyDerivError> {
-    let entropy_len = if words == 12 { 16 } else { 32 };
+    let entropy_len = match words {
+        12 => 16,
+        24 => 32,
+        other => return Err(KeyDerivError::InvalidWordCount(other)),
+    };
     let mut entropy = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy[..entropy_len]);
     let mnemonic = Mnemonic::from_entropy(&entropy[..entropy_len])
@@ -234,5 +240,11 @@ mod tests {
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
         let result = derive_keypair_from_mnemonic(mnemonic, "not/a/valid/path");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_word_count_rejected() {
+        let result = generate_random_keypair_with_words(DEFAULT_COSMOS_PATH, 13);
+        assert!(matches!(result, Err(KeyDerivError::InvalidWordCount(13))));
     }
 }
