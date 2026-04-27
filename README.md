@@ -117,6 +117,10 @@ cosmos-vanity search -p abc --gpu-api cuda -m gpu -k mnemonic -w 12
 # CPU only mnemonic mode
 cosmos-vanity search -p abc -m cpu -k mnemonic
 
+# write secrets to a new JSON Lines file instead of stdout
+cosmos-vanity search -p abc -m cpu -k mnemonic --secret-output-file ./vanity-secrets.jsonl
+cosmos-vanity generate --secret-output-file ./generated-secret.jsonl
+
 # verify without putting the mnemonic in argv/shell history
 cosmos-vanity verify --mnemonic-file ./mnemonic.txt --address cosmos1...
 
@@ -145,7 +149,7 @@ target\release\cosmos-vanity.exe search -p n0s --gpu-api cuda -m gpu --format js
 
 ## Security notes
 
-- mnemonic/private-key output is redacted by default; `--unsafe-print-secrets` is required to print wallet secrets to stdout
+- mnemonic/private-key output is redacted by default; use `--secret-output-file <path>` to write secrets to a new restrictive-permission file, or `--unsafe-print-secrets` to print them to stdout
 - `verify --mnemonic-file <path>` avoids putting mnemonics in argv/shell history; legacy `--mnemonic` still works but is hidden and warns
 - raw key mode is only allowed on the pure GPU raw path; CPU, hybrid, and GPU fallback paths must use mnemonic mode
 - every reported match is verified again on CPU before output; failed verification results are skipped, not counted
