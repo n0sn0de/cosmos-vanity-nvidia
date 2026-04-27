@@ -3,7 +3,9 @@
 //! Command-line interface for Cosmos vanity address generation
 //! in the NVIDIA/CUDA-focused repo split.
 
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -85,6 +87,10 @@ enum Commands {
         #[arg(long)]
         state_file: Option<PathBuf>,
 
+        /// Write secret material to a new JSON Lines file with restrictive permissions
+        #[arg(long)]
+        secret_output_file: Option<PathBuf>,
+
         /// Checkpoint interval (save state every N candidates)
         #[arg(long, default_value = "100000")]
         checkpoint_interval: u64,
@@ -133,6 +139,10 @@ enum Commands {
         /// Derivation path
         #[arg(long, default_value = "m/44'/118'/0'/0/0")]
         path: String,
+
+        /// Write secret material to a new JSON file with restrictive permissions
+        #[arg(long)]
+        secret_output_file: Option<PathBuf>,
     },
 }
 
@@ -224,6 +234,59 @@ fn parse_mnemonic_words(value: &str) -> std::result::Result<u8, String> {
     }
 }
 
+struct SecretSink {
+    path: PathBuf,
+    writer: BufWriter<File>,
+}
+
+impl SecretSink {
+    fn create(path: Option<&Path>) -> Result<Option<Self>> {
+        let Some(path) = path else {
+            return Ok(None);
+        };
+
+        let file = create_secret_file(path)?;
+        Ok(Some(Self {
+            path: path.to_path_buf(),
+            writer: BufWriter::new(file),
+        }))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn write_json_line(&mut self, value: &serde_json::Value) -> Result<()> {
+        serde_json::to_writer(&mut self.writer, value)
+            .context("failed to serialize secret output")?;
+        self.writer
+            .write_all(b"\n")
+            .context("failed to write secret output")?;
+        self.writer
+            .flush()
+            .context("failed to flush secret output")?;
+        Ok(())
+    }
+}
+
+fn create_secret_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    options.open(path).with_context(|| {
+        format!(
+            "failed to create secret output file {} (refusing to overwrite existing files)",
+            path.display()
+        )
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -246,6 +309,7 @@ fn main() -> Result<()> {
             max_matches,
             state_file,
             checkpoint_interval,
+            secret_output_file,
             words,
         } => {
             let vanity_pattern = match match_type {
@@ -290,6 +354,7 @@ fn main() -> Result<()> {
                 mnemonic_words: words,
                 state_file,
             };
+            let mut secret_sink = SecretSink::create(secret_output_file.as_deref())?;
 
             let mode_label = match effective_mode {
                 SearchMode::Gpu => "gpu (pure GPU)",
@@ -313,6 +378,9 @@ fn main() -> Result<()> {
                 println!("   Words:    {words}");
             }
             println!("   Max hits: {max_matches}");
+            if let Some(sink) = &secret_sink {
+                println!("   Secret file: {}", sink.path().display());
+            }
             println!(
                 "   Difficulty: ~{} avg candidates ({})",
                 format_number(expected_candidates),
@@ -477,6 +545,7 @@ fn main() -> Result<()> {
             let mut found = 0;
             for result in rx.iter() {
                 let mut accepted = false;
+                let mut fatal_error: Option<anyhow::Error> = None;
 
                 pb.suspend(|| {
                     if effective_key_mode == KeyMode::Raw {
@@ -496,6 +565,22 @@ fn main() -> Result<()> {
                         if !verified {
                             eprintln!("⚠️  Match skipped: private key failed address verification.");
                             return;
+                        }
+
+                        let secret_json = serde_json::json!({
+                            "type": "search_match",
+                            "address": &result.address,
+                            "private_key": privkey_hex,
+                            "candidate_number": result.candidate_number,
+                            "elapsed_secs": result.elapsed_secs,
+                            "verified": true,
+                            "key_mode": "raw",
+                        });
+                        if let Some(sink) = &mut secret_sink {
+                            if let Err(e) = sink.write_json_line(&secret_json) {
+                                fatal_error = Some(e);
+                                return;
+                            }
                         }
 
                         found += 1;
@@ -558,6 +643,23 @@ fn main() -> Result<()> {
                             &vanity_pattern,
                         ) {
                             Ok(verification) if verification.verified => {
+                                let secret_json = serde_json::json!({
+                                    "type": "search_match",
+                                    "address": &result.address,
+                                    "mnemonic": &result.mnemonic,
+                                    "derivation_path": &result.derivation_path,
+                                    "candidate_number": result.candidate_number,
+                                    "elapsed_secs": result.elapsed_secs,
+                                    "verified": true,
+                                    "key_mode": "mnemonic",
+                                });
+                                if let Some(sink) = &mut secret_sink {
+                                    if let Err(e) = sink.write_json_line(&secret_json) {
+                                        fatal_error = Some(e);
+                                        return;
+                                    }
+                                }
+
                                 found += 1;
                                 accepted = true;
 
@@ -621,6 +723,11 @@ fn main() -> Result<()> {
                         }
                     }
                 });
+
+                if let Some(e) = fatal_error {
+                    searcher.stop();
+                    return Err(e);
+                }
 
                 if accepted && max_matches > 0 && found >= max_matches {
                     searcher.stop();
@@ -695,9 +802,24 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Generate { hrp, path } => {
+        Commands::Generate {
+            hrp,
+            path,
+            secret_output_file,
+        } => {
             let key = cosmos_vanity_keyderiv::generate_random_keypair_with_path(&path)?;
             let address = cosmos_vanity_address::pubkey_to_bech32(key.public_key_bytes(), &hrp)?;
+            let mut secret_sink = SecretSink::create(secret_output_file.as_deref())?;
+            let secret_json = serde_json::json!({
+                "type": "generate",
+                "address": &address,
+                "mnemonic": key.mnemonic(),
+                "derivation_path": key.derivation_path(),
+                "key_mode": "mnemonic",
+            });
+            if let Some(sink) = &mut secret_sink {
+                sink.write_json_line(&secret_json)?;
+            }
 
             match cli.format {
                 OutputFormat::Text => {
@@ -710,6 +832,9 @@ fn main() -> Result<()> {
                         );
                     }
                     println!("Path:     {}", key.derivation_path());
+                    if let Some(sink) = &secret_sink {
+                        println!("Secret file: {}", sink.path().display());
+                    }
                     if !cli.unsafe_print_secrets {
                         println!("🔒 Secret output is redacted by default.");
                     }
@@ -720,12 +845,14 @@ fn main() -> Result<()> {
                             "address": address,
                             "mnemonic": key.mnemonic(),
                             "derivation_path": key.derivation_path(),
+                            "secret_output_file": secret_sink.as_ref().map(|sink| sink.path().display().to_string()),
                             "secret_redacted": false,
                         })
                     } else {
                         serde_json::json!({
                             "address": address,
                             "derivation_path": key.derivation_path(),
+                            "secret_output_file": secret_sink.as_ref().map(|sink| sink.path().display().to_string()),
                             "secret_redacted": true,
                         })
                     };
@@ -878,6 +1005,69 @@ mod tests {
 
         assert!(cli.unsafe_print_secrets);
         assert!(matches!(cli.command, Commands::Generate { .. }));
+    }
+
+    fn unique_secret_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cosmos-vanity-{name}-{}-{nanos}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn secret_sink_writes_json_line_and_refuses_overwrite() {
+        let path = unique_secret_path("secret-sink");
+
+        {
+            let mut sink = SecretSink::create(Some(&path)).unwrap().unwrap();
+            sink.write_json_line(&serde_json::json!({"mnemonic": "test secret"}))
+                .unwrap();
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("test secret"));
+
+        let err = match SecretSink::create(Some(&path)) {
+            Err(e) => e,
+            Ok(_) => panic!("secret sink overwrote an existing file"),
+        };
+        assert!(err.to_string().contains("refusing to overwrite"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn generate_accepts_secret_output_file() {
+        let cli = Cli::try_parse_from([
+            "cosmos-vanity",
+            "generate",
+            "--secret-output-file",
+            "/tmp/secrets.jsonl",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Generate {
+                secret_output_file, ..
+            } => {
+                assert_eq!(
+                    secret_output_file.unwrap(),
+                    PathBuf::from("/tmp/secrets.jsonl")
+                );
+            }
+            _ => panic!("expected generate command"),
+        }
     }
 
     #[test]
