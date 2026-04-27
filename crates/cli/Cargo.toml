@@ -3,7 +3,7 @@ name = "cosmos-vanity-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI for Cosmos vanity address generation with OpenCL and CUDA GPU acceleration"
+description = "CLI for Cosmos vanity address generation in the NVIDIA/CUDA-focused repo split"
 
 [[bin]]
 name = "cosmos-vanity"

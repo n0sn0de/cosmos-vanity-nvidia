@@ -3,7 +3,7 @@ name = "cosmos-vanity-gpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "OpenCL and CUDA GPU acceleration for Cosmos vanity address generation"
+description = "GPU acceleration for Cosmos vanity address generation, focused on NVIDIA/CUDA"
 
 [features]
 default = []

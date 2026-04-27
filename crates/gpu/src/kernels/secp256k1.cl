@@ -1,5 +1,5 @@
 // =============================================================================
-// cosmos-vanity-amd — secp256k1 GPU kernel
+// cosmos-vanity — shared secp256k1 GPU kernel
 // =============================================================================
 //
 // Full secp256k1 EC point multiplication on GPU:

@@ -1,5 +1,5 @@
 // =============================================================================
-// cosmos-vanity-amd — OpenCL kernel for SHA-256 + RIPEMD-160 hashing
+// cosmos-vanity — shared GPU kernel for SHA-256 + RIPEMD-160 hashing
 // =============================================================================
 //
 // This kernel takes compressed public key bytes and computes the Cosmos

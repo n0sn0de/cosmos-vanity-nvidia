@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["n0sn0de"]
-repository = "https://github.com/n0sn0de/cosmos-vanity-amd"
+repository = "https://github.com/n0sn0de/cosmos-vanity-nvidia"
 
 [workspace.dependencies]
 # Internal crates

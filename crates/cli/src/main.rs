@@ -1,7 +1,7 @@
 //! # cosmos-vanity CLI
 //!
 //! Command-line interface for Cosmos vanity address generation
-//! with OpenCL and CUDA GPU acceleration.
+//! in the NVIDIA/CUDA-focused repo split.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;

@@ -1,5 +1,5 @@
 // =============================================================================
-// cosmos-vanity-amd — Full GPU mnemonic pipeline
+// cosmos-vanity — full GPU mnemonic pipeline
 // SHA-512 → HMAC-SHA512 → PBKDF2 → BIP-32 → secp256k1 → SHA-256 → RIPEMD-160
 // =============================================================================
 //
