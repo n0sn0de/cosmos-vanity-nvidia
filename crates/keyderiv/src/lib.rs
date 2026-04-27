@@ -11,7 +11,7 @@ use bip39::Mnemonic;
 use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::NetworkKind;
 use secp256k1::Secp256k1;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub use bip39;
 pub use secp256k1;
@@ -51,9 +51,6 @@ pub enum KeyDerivError {
 pub struct DerivedKey {
     /// The BIP-39 mnemonic phrase.
     mnemonic_phrase: String,
-
-    /// Raw seed bytes derived from the mnemonic
-    seed: Vec<u8>,
 
     /// The derived private key bytes (32 bytes)
     secret_key_bytes: Vec<u8>,
@@ -133,7 +130,11 @@ pub fn generate_random_keypair_with_words(
     let mnemonic = Mnemonic::from_entropy(&entropy[..entropy_len])
         .map_err(|e| KeyDerivError::Bip39(e.to_string()))?;
     entropy.zeroize();
-    derive_keypair_from_mnemonic(&mnemonic.to_string(), path)
+
+    let mut mnemonic_phrase = mnemonic.to_string();
+    let result = derive_keypair_from_mnemonic(&mnemonic_phrase, path);
+    mnemonic_phrase.zeroize();
+    result
 }
 
 /// Derive a keypair from an existing mnemonic phrase and derivation path.
@@ -145,8 +146,9 @@ pub fn derive_keypair_from_mnemonic(
         .parse()
         .map_err(|e: bip39::Error| KeyDerivError::Bip39(e.to_string()))?;
 
-    // BIP-39 seed (no passphrase — standard for Cosmos wallets)
-    let seed = mnemonic.to_seed("");
+    // BIP-39 seed (no passphrase — standard for Cosmos wallets).
+    // Keep this as a stack-backed zeroizing value instead of retaining it in DerivedKey.
+    let seed = Zeroizing::new(mnemonic.to_seed(""));
 
     // Parse derivation path
     let derivation_path: DerivationPath = path
@@ -154,7 +156,7 @@ pub fn derive_keypair_from_mnemonic(
         .map_err(|e: bitcoin::bip32::Error| KeyDerivError::InvalidPath(e.to_string()))?;
 
     // Derive the extended private key
-    let xpriv = Xpriv::new_master(NetworkKind::Main, &seed)
+    let xpriv = Xpriv::new_master(NetworkKind::Main, &seed[..])
         .map_err(|e| KeyDerivError::Bip32(e.to_string()))?;
 
     let secp = Secp256k1::new();
@@ -165,11 +167,11 @@ pub fn derive_keypair_from_mnemonic(
     // Get the public key
     let secret_key = derived.private_key;
     let public_key = secret_key.public_key(&secp);
+    let secret_key_bytes = Zeroizing::new(secret_key.secret_bytes());
 
     Ok(DerivedKey {
         mnemonic_phrase: mnemonic.to_string(),
-        seed: seed.to_vec(),
-        secret_key_bytes: secret_key.secret_bytes().to_vec(),
+        secret_key_bytes: secret_key_bytes.to_vec(),
         public_key_bytes: public_key.serialize().to_vec(),
         derivation_path: path.to_string(),
     })
