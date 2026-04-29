@@ -7,8 +7,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 use crossbeam_channel::{bounded, Receiver};
-#[cfg(any(feature = "opencl", feature = "cuda"))]
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[cfg(any(feature = "opencl", feature = "cuda"))]
 use cosmos_vanity_address::encode_bech32;
@@ -144,7 +143,12 @@ impl Default for SearchConfig {
 }
 
 /// A verified search result.
-#[derive(Debug, Clone)]
+///
+/// # Security
+///
+/// This type can hold wallet secrets (`mnemonic` or `private_key_hex`). It redacts
+/// secret fields from [`Debug`] output and zeroizes its owned buffers on drop.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SearchResult {
     /// The matching Bech32 address
     pub address: String,
@@ -163,6 +167,26 @@ pub struct SearchResult {
 
     /// Raw private key hex (only set in raw key mode)
     pub private_key_hex: Option<String>,
+}
+
+impl std::fmt::Debug for SearchResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mnemonic = if self.mnemonic.is_empty() {
+            "<empty>"
+        } else {
+            "<redacted>"
+        };
+        let private_key_hex = self.private_key_hex.as_ref().map(|_| "<redacted>");
+
+        f.debug_struct("SearchResult")
+            .field("address", &self.address)
+            .field("mnemonic", &mnemonic)
+            .field("derivation_path", &self.derivation_path)
+            .field("candidate_number", &self.candidate_number)
+            .field("elapsed_secs", &self.elapsed_secs)
+            .field("private_key_hex", &private_key_hex)
+            .finish()
+    }
 }
 
 /// The main vanity address searcher.
@@ -1312,6 +1336,27 @@ mod tests {
         assert_eq!(format!("{}", SearchMode::Gpu), "gpu");
         assert_eq!(format!("{}", SearchMode::Hybrid), "hybrid");
         assert_eq!(format!("{}", SearchMode::Cpu), "cpu");
+    }
+
+    #[test]
+    fn test_search_result_debug_redacts_secrets() {
+        let result = SearchResult {
+            address: "cosmos1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqnrql8a".to_string(),
+            mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
+            derivation_path: cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH.to_string(),
+            candidate_number: 7,
+            elapsed_secs: 0.25,
+            private_key_hex: Some(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+            ),
+        };
+
+        let debug = format!("{result:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("abandon abandon"));
+        assert!(!debug.contains("0123456789abcdef"));
     }
 
     #[cfg(any(feature = "opencl", feature = "cuda"))]

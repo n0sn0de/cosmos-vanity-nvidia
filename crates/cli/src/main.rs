@@ -612,7 +612,7 @@ fn main() -> Result<()> {
                             OutputFormat::Json => {
                                 let json = if cli.unsafe_print_secrets {
                                     serde_json::json!({
-                                        "address": result.address,
+                                        "address": &result.address,
                                         "private_key": privkey_hex,
                                         "candidate_number": result.candidate_number,
                                         "elapsed_secs": result.elapsed_secs,
@@ -622,7 +622,7 @@ fn main() -> Result<()> {
                                     })
                                 } else {
                                     serde_json::json!({
-                                        "address": result.address,
+                                        "address": &result.address,
                                         "candidate_number": result.candidate_number,
                                         "elapsed_secs": result.elapsed_secs,
                                         "verified": true,
@@ -687,9 +687,9 @@ fn main() -> Result<()> {
                                     OutputFormat::Json => {
                                         let json = if cli.unsafe_print_secrets {
                                             serde_json::json!({
-                                                "address": result.address,
-                                                "mnemonic": result.mnemonic,
-                                                "derivation_path": result.derivation_path,
+                                                "address": &result.address,
+                                                "mnemonic": &result.mnemonic,
+                                                "derivation_path": &result.derivation_path,
                                                 "candidate_number": result.candidate_number,
                                                 "elapsed_secs": result.elapsed_secs,
                                                 "verified": true,
@@ -698,8 +698,8 @@ fn main() -> Result<()> {
                                             })
                                         } else {
                                             serde_json::json!({
-                                                "address": result.address,
-                                                "derivation_path": result.derivation_path,
+                                                "address": &result.address,
+                                                "derivation_path": &result.derivation_path,
                                                 "candidate_number": result.candidate_number,
                                                 "elapsed_secs": result.elapsed_secs,
                                                 "verified": true,
