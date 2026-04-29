@@ -32,6 +32,7 @@ const HASH_SIZE: usize = 20;
 const PRIVKEY_SIZE: usize = 32;
 
 type GpuBatchResult = (Vec<u8>, Vec<u8>, Vec<u32>);
+type MnemonicBatchResult = (Vec<u8>, Vec<u32>);
 
 const CUDA_COMPAT_PREAMBLE: &str = r#"
 typedef unsigned int uint;
@@ -343,11 +344,16 @@ impl GpuContext {
     }
 
     /// Run the full mnemonic pipeline on CUDA.
+    ///
+    /// # Security
+    ///
+    /// The kernel still uses a device-side private-key buffer internally, but this API
+    /// deliberately never copies those derived private keys back into host memory.
     pub fn mnemonic_batch(
         &self,
         mnemonics_flat: &[u8],
         mnemonic_lens: &[u32],
-    ) -> Result<GpuBatchResult, GpuError> {
+    ) -> Result<MnemonicBatchResult, GpuError> {
         let function = self.ensure_mnemonic_function()?;
 
         let n = mnemonic_lens.len();
@@ -382,7 +388,6 @@ impl GpuContext {
         self.stream.synchronize()?;
 
         Ok((
-            self.stream.clone_dtoh(&privkeys_buf)?,
             self.stream.clone_dtoh(&hashes_buf)?,
             self.stream.clone_dtoh(&matches_buf)?,
         ))
@@ -1184,7 +1189,7 @@ mod tests {
             &self,
             mnemonics_flat: &[u8],
             mnemonic_lens: &[u32],
-        ) -> anyhow::Result<(Vec<u8>, Vec<u8>, Vec<u32>)> {
+        ) -> anyhow::Result<(Vec<u8>, Vec<u32>)> {
             Ok(GpuContext::mnemonic_batch(
                 self,
                 mnemonics_flat,
