@@ -28,7 +28,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ocl-icd-opencl-dev clinfo
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -36,19 +38,19 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --features "opencl cuda" -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --features "opencl cuda" -- -D warnings
 
       - name: Test workspace (default)
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Test workspace (cuda)
-        run: cargo test --workspace --features cuda
+        run: cargo test --locked --workspace --features cuda
 
       - name: Test workspace (opencl + cuda)
-        run: cargo test --workspace --features "opencl cuda"
+        run: cargo test --locked --workspace --features "opencl cuda"
 
       - name: Build release binary (linux gpu bundle)
-        run: cargo build --release -p cosmos-vanity-cli --features "opencl cuda"
+        run: cargo build --locked --release -p cosmos-vanity-cli --features "opencl cuda"
 
   windows:
     name: Windows build and test
@@ -57,15 +59,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.0
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Test workspace (default)
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Test workspace (cuda)
-        run: cargo test --workspace --features cuda
+        run: cargo test --locked --workspace --features cuda
 
       - name: Build release binary (windows cuda bundle)
-        run: cargo build --release -p cosmos-vanity-cli --features cuda
+        run: cargo build --locked --release -p cosmos-vanity-cli --features cuda

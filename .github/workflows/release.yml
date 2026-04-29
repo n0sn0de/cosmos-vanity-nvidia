@@ -33,7 +33,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ocl-icd-opencl-dev clinfo
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -42,9 +42,9 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${{ matrix.features }}" ]]; then
-            cargo build --release -p cosmos-vanity-cli --features "${{ matrix.features }}"
+            cargo build --locked --release -p cosmos-vanity-cli --features "${{ matrix.features }}"
           else
-            cargo build --release -p cosmos-vanity-cli
+            cargo build --locked --release -p cosmos-vanity-cli
           fi
 
       - name: Package artifact
@@ -76,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.94.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -85,9 +85,9 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${{ matrix.features }}" ]]; then
-            cargo build --release -p cosmos-vanity-cli --features "${{ matrix.features }}"
+            cargo build --locked --release -p cosmos-vanity-cli --features "${{ matrix.features }}"
           else
-            cargo build --release -p cosmos-vanity-cli
+            cargo build --locked --release -p cosmos-vanity-cli
           fi
 
       - name: Package artifact
