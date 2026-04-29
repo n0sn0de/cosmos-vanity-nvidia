@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use chrono::Utc;
@@ -62,6 +62,42 @@ impl std::fmt::Display for GpuApi {
     }
 }
 
+/// CUDA device selection policy.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum GpuDeviceSelection {
+    /// Backward-compatible default CUDA device selection behavior.
+    #[default]
+    Default,
+    /// Use every visible CUDA device.
+    All,
+    /// Use a specific set of CUDA device indices.
+    Indices(Vec<usize>),
+}
+
+impl GpuDeviceSelection {
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+}
+
+impl std::fmt::Display for GpuDeviceSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => write!(f, "default"),
+            Self::All => write!(f, "all"),
+            Self::Indices(indices) => write!(
+                f,
+                "{}",
+                indices
+                    .iter()
+                    .map(|index| index.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        }
+    }
+}
+
 /// Search mode for vanity address generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -111,6 +147,9 @@ pub struct SearchConfig {
     /// Preferred GPU backend API.
     pub gpu_api: GpuApi,
 
+    /// CUDA device selection (ignored for CPU/OpenCL search).
+    pub gpu_devices: GpuDeviceSelection,
+
     /// Mnemonic word count: 12 (128-bit) or 24 (256-bit)
     pub mnemonic_words: u8,
 
@@ -134,6 +173,7 @@ impl Default for SearchConfig {
             mode: SearchMode::Cpu,
             key_mode: KeyMode::default(),
             gpu_api: GpuApi::default(),
+            gpu_devices: GpuDeviceSelection::default(),
             mnemonic_words: 12,
             max_matches: 1,
             checkpoint_interval: 100_000,
@@ -195,6 +235,7 @@ pub struct VanitySearcher {
     state: SearchState,
     candidates_checked: Arc<AtomicU64>,
     should_stop: Arc<AtomicBool>,
+    runtime_error: Arc<Mutex<Option<String>>>,
 }
 
 impl VanitySearcher {
@@ -231,6 +272,7 @@ impl VanitySearcher {
             state,
             candidates_checked,
             should_stop: Arc::new(AtomicBool::new(false)),
+            runtime_error: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -252,6 +294,68 @@ impl VanitySearcher {
     /// Get a handle to the candidates counter for progress reporting.
     pub fn candidates_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.candidates_checked)
+    }
+
+    /// Take the first runtime error reported by a background worker, if any.
+    pub fn take_runtime_error(&self) -> Option<String> {
+        self.runtime_error
+            .lock()
+            .expect("runtime error mutex poisoned")
+            .take()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn use_explicit_cuda_devices(&self) -> bool {
+        self.config.gpu_api == GpuApi::Cuda && !self.config.gpu_devices.is_default()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn selected_cuda_contexts(&self) -> anyhow::Result<Vec<crate::cuda::GpuContext>> {
+        let device_infos = crate::cuda::list_devices()
+            .map_err(|err| anyhow::anyhow!("CUDA device enumeration failed: {err}"))?;
+
+        let requested_indices = match &self.config.gpu_devices {
+            GpuDeviceSelection::Default => vec![0],
+            GpuDeviceSelection::All => device_infos.iter().map(|info| info.index).collect(),
+            GpuDeviceSelection::Indices(indices) => indices.clone(),
+        };
+
+        if requested_indices.is_empty() {
+            return Err(anyhow::anyhow!("No CUDA devices selected"));
+        }
+
+        let mut contexts = Vec::with_capacity(requested_indices.len());
+        let mut failures = Vec::new();
+
+        for index in &requested_indices {
+            match crate::cuda::GpuContext::new_for_device(*index) {
+                Ok(ctx) => contexts.push(ctx),
+                Err(err) => {
+                    let label = device_infos
+                        .iter()
+                        .find(|info| info.index == *index)
+                        .map(|info| info.name.as_str())
+                        .unwrap_or("unknown CUDA device");
+                    failures.push(format!("[{index}] {label}: {err}"));
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            if requested_indices.len() == 1 {
+                return Err(anyhow::anyhow!(
+                    "Requested CUDA device failed to initialize: {}",
+                    failures[0]
+                ));
+            }
+
+            return Err(anyhow::anyhow!(
+                "One or more requested CUDA devices failed to initialize: {}",
+                failures.join("; ")
+            ));
+        }
+
+        Ok(contexts)
     }
 
     /// Run the search using CPU threads (fallback mode).
@@ -380,6 +484,11 @@ impl VanitySearcher {
     /// This ensures we never lose CPU throughput — the GPU path is purely additive.
     #[cfg(any(feature = "opencl", feature = "cuda"))]
     pub fn search_hybrid(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
+        #[cfg(feature = "cuda")]
+        if self.use_explicit_cuda_devices() {
+            return self.search_hybrid_multi_cuda();
+        }
+
         let gpu_ctx = ActiveGpuContext::new(self.config.gpu_api)?;
         // Use larger batches to amortize kernel launch overhead
         let batch_size = (gpu_ctx.suggested_batch_size()).max(32_768);
@@ -661,6 +770,11 @@ impl VanitySearcher {
     /// - Atomic match counter for early termination
     #[cfg(any(feature = "opencl", feature = "cuda"))]
     pub fn search_gpu_pure(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
+        #[cfg(feature = "cuda")]
+        if self.use_explicit_cuda_devices() {
+            return self.search_gpu_pure_multi_cuda();
+        }
+
         let gpu_ctx = ActiveGpuContext::new(self.config.gpu_api)?;
         // Pure GPU mode uses larger batches for max occupancy
         let batch_size = gpu_ctx.pure_gpu_batch_size();
@@ -890,6 +1004,11 @@ impl VanitySearcher {
     pub fn search_gpu_raw(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
         use rand::RngCore;
 
+        #[cfg(feature = "cuda")]
+        if self.use_explicit_cuda_devices() {
+            return self.search_gpu_raw_multi_cuda();
+        }
+
         let gpu_ctx = ActiveGpuContext::new(self.config.gpu_api)?;
 
         if !gpu_ctx.has_secp256k1_kernel() {
@@ -1018,6 +1137,11 @@ impl VanitySearcher {
     #[cfg(any(feature = "opencl", feature = "cuda"))]
     pub fn search_gpu_mnemonic(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
         use cosmos_vanity_keyderiv::bip39::Mnemonic;
+
+        #[cfg(feature = "cuda")]
+        if self.use_explicit_cuda_devices() {
+            return self.search_gpu_mnemonic_multi_cuda();
+        }
 
         let derivation_path = self.config.derivation_path.clone();
         if derivation_path != cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH {
@@ -1227,6 +1351,868 @@ impl VanitySearcher {
         Ok(result_rx)
     }
 
+    #[cfg(feature = "cuda")]
+    fn search_hybrid_multi_cuda(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
+        let gpu_contexts = self.selected_cuda_contexts()?;
+        let batch_sizes = gpu_contexts
+            .iter()
+            .map(|ctx| ctx.suggested_batch_size().max(32_768))
+            .collect::<Vec<_>>();
+        let total_batch_size = batch_sizes.iter().sum::<usize>().max(1);
+
+        tracing::info!(
+            "Starting multi-CUDA hybrid search on {} device(s): {}",
+            gpu_contexts.len(),
+            gpu_contexts
+                .iter()
+                .zip(batch_sizes.iter())
+                .map(|(ctx, batch_size)| {
+                    format!("{} batch={}", format_cuda_context_label(ctx), batch_size)
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+
+        self.config.pattern.validate_bech32_charset()?;
+
+        let (result_tx, result_rx) = bounded::<SearchResult>(32);
+        let start = Instant::now();
+        let pattern = self.config.pattern.clone();
+        let hrp = self.config.hrp.clone();
+        let path = self.config.derivation_path.clone();
+        let mnemonic_words = self.config.mnemonic_words;
+        let max_matches = self.config.max_matches;
+        let counter = Arc::clone(&self.candidates_checked);
+        let stop_flag = Arc::clone(&self.should_stop);
+        let runtime_error = Arc::clone(&self.runtime_error);
+        let num_cpu_threads = self.config.num_threads;
+        let matches_found = Arc::new(AtomicU64::new(self.state.matches_found));
+
+        let cpu_search_threads = num_cpu_threads.saturating_sub(1);
+        let keygen_threads = num_cpu_threads.max(gpu_contexts.len());
+
+        tracing::info!(
+            "Hybrid mode: {} CPU search threads + {} CUDA keygen threads + {} CUDA devices",
+            cpu_search_threads,
+            keygen_threads,
+            gpu_contexts.len(),
+        );
+
+        for thread_id in 0..cpu_search_threads {
+            let tx = result_tx.clone();
+            let pattern = pattern.clone();
+            let hrp = hrp.clone();
+            let path = path.clone();
+            let counter = Arc::clone(&counter);
+            let stop_flag = Arc::clone(&stop_flag);
+            let matches_found = Arc::clone(&matches_found);
+
+            std::thread::Builder::new()
+                .name(format!("cpu-search-{thread_id}"))
+                .spawn(move || {
+                    tracing::debug!("CPU search worker {thread_id} started");
+
+                    loop {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if max_matches > 0
+                            && matches_found.load(Ordering::Relaxed) >= max_matches as u64
+                        {
+                            break;
+                        }
+
+                        let key = match generate_random_keypair_with_words(&path, mnemonic_words) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                tracing::error!("Key generation error: {e}");
+                                continue;
+                            }
+                        };
+
+                        let candidate_num = counter.fetch_add(1, Ordering::Relaxed);
+
+                        let address = match pubkey_to_bech32(key.public_key_bytes(), &hrp) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::error!("Address generation error: {e}");
+                                continue;
+                            }
+                        };
+
+                        if pattern.matches(&address, &hrp) {
+                            let elapsed = start.elapsed().as_secs_f64();
+                            tracing::info!(
+                                "🎯 CPU Match found! Address: {} (candidate #{})",
+                                address,
+                                candidate_num
+                            );
+
+                            matches_found.fetch_add(1, Ordering::Relaxed);
+
+                            let result = SearchResult {
+                                address,
+                                mnemonic: key.mnemonic().to_string(),
+                                derivation_path: key.derivation_path().to_string(),
+                                candidate_number: candidate_num,
+                                elapsed_secs: elapsed,
+                                private_key_hex: None,
+                            };
+
+                            if tx.send(result).is_err() {
+                                break;
+                            }
+                        }
+
+                        drop(key);
+                    }
+
+                    tracing::debug!("CPU search worker {thread_id} exited");
+                })?;
+        }
+
+        let (keygen_tx, keygen_rx) =
+            bounded::<(Vec<u8>, String, String)>(total_batch_size.saturating_mul(2).max(1));
+
+        for thread_id in 0..keygen_threads {
+            let keygen_tx = keygen_tx.clone();
+            let path = path.clone();
+            let stop_flag = Arc::clone(&stop_flag);
+            let matches_found = Arc::clone(&matches_found);
+
+            std::thread::Builder::new()
+                .name(format!("cuda-keygen-{thread_id}"))
+                .spawn(move || {
+                    tracing::debug!("CUDA keygen worker {thread_id} started");
+
+                    loop {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if max_matches > 0
+                            && matches_found.load(Ordering::Relaxed) >= max_matches as u64
+                        {
+                            break;
+                        }
+
+                        let key = match generate_random_keypair_with_words(&path, mnemonic_words) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                tracing::error!("Keygen error: {e}");
+                                continue;
+                            }
+                        };
+
+                        let pubkey = key.public_key_bytes().to_vec();
+                        let mnemonic = key.mnemonic().to_string();
+                        let deriv_path = key.derivation_path().to_string();
+                        drop(key);
+
+                        if keygen_tx.send((pubkey, mnemonic, deriv_path)).is_err() {
+                            break;
+                        }
+                    }
+
+                    tracing::debug!("CUDA keygen worker {thread_id} exited");
+                })?;
+        }
+
+        drop(keygen_tx);
+
+        for (gpu_ctx, batch_size) in gpu_contexts.into_iter().zip(batch_sizes.into_iter()) {
+            let keygen_rx = keygen_rx.clone();
+            let gpu_result_tx = result_tx.clone();
+            let gpu_counter = Arc::clone(&counter);
+            let gpu_stop = Arc::clone(&stop_flag);
+            let gpu_matches = Arc::clone(&matches_found);
+            let runtime_error = Arc::clone(&runtime_error);
+            let gpu_pattern = pattern.clone();
+            let gpu_hrp = hrp.clone();
+
+            std::thread::Builder::new()
+                .name(format!("cuda-hybrid-{}", gpu_ctx.device_index()))
+                .spawn(move || {
+                    tracing::debug!(
+                        "Hybrid CUDA worker {} started on {}",
+                        gpu_ctx.device_index(),
+                        gpu_ctx.device_name(),
+                    );
+
+                    let mut batch = KeyBatch::with_capacity(batch_size);
+
+                    loop {
+                        if gpu_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if max_matches > 0
+                            && gpu_matches.load(Ordering::Relaxed) >= max_matches as u64
+                        {
+                            break;
+                        }
+                        if !fill_batch(
+                            &keygen_rx,
+                            &mut batch,
+                            batch_size,
+                            &gpu_stop,
+                            &gpu_matches,
+                            max_matches,
+                        ) {
+                            break;
+                        }
+
+                        let actual_batch = batch.mnemonics.len();
+                        if actual_batch == 0 {
+                            continue;
+                        }
+
+                        let hashes = match gpu_ctx.hash_pubkeys_batch(&batch.pubkeys) {
+                            Ok(hashes) => hashes,
+                            Err(e) => {
+                                batch.clear();
+                                record_runtime_error(
+                                    &runtime_error,
+                                    &gpu_stop,
+                                    format!(
+                                        "CUDA device {} failed during hybrid execution: {e}",
+                                        format_cuda_context_label(&gpu_ctx)
+                                    ),
+                                );
+                                break;
+                            }
+                        };
+
+                        let batch_start =
+                            gpu_counter.fetch_add(actual_batch as u64, Ordering::Relaxed);
+
+                        for i in 0..actual_batch {
+                            let hash_bytes: [u8; 20] =
+                                hashes[i * 20..(i + 1) * 20].try_into().expect("20 bytes");
+
+                            let address = match encode_bech32(&gpu_hrp, &hash_bytes) {
+                                Ok(address) => address,
+                                Err(_) => continue,
+                            };
+
+                            if gpu_pattern.matches(&address, &gpu_hrp) {
+                                let candidate_num = batch_start + i as u64;
+                                let elapsed = start.elapsed().as_secs_f64();
+                                tracing::info!(
+                                    "🎯 GPU Match found! Address: {} (candidate #{})",
+                                    address,
+                                    candidate_num
+                                );
+
+                                gpu_matches.fetch_add(1, Ordering::Relaxed);
+
+                                let result = SearchResult {
+                                    address,
+                                    mnemonic: batch.mnemonics[i].clone(),
+                                    derivation_path: batch.paths[i].clone(),
+                                    candidate_number: candidate_num,
+                                    elapsed_secs: elapsed,
+                                    private_key_hex: None,
+                                };
+
+                                if gpu_result_tx.send(result).is_err() {
+                                    batch.clear();
+                                    return;
+                                }
+                            }
+                        }
+
+                        batch.clear();
+                    }
+
+                    batch.clear();
+                    tracing::debug!("Hybrid CUDA worker {} exited", gpu_ctx.device_index(),);
+                })?;
+        }
+
+        drop(result_tx);
+        Ok(result_rx)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn search_gpu_pure_multi_cuda(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
+        let gpu_contexts = self.selected_cuda_contexts()?;
+        let batch_sizes = gpu_contexts
+            .iter()
+            .map(|ctx| ctx.pure_gpu_batch_size())
+            .collect::<Vec<_>>();
+        let total_batch_size = batch_sizes.iter().sum::<usize>().max(1);
+
+        tracing::info!(
+            "Starting multi-CUDA pure GPU search on {} device(s): {}",
+            gpu_contexts.len(),
+            gpu_contexts
+                .iter()
+                .zip(batch_sizes.iter())
+                .map(|(ctx, batch_size)| {
+                    format!("{} batch={}", format_cuda_context_label(ctx), batch_size)
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+
+        self.config.pattern.validate_bech32_charset()?;
+
+        let (result_tx, result_rx) = bounded::<SearchResult>(32);
+        let start = Instant::now();
+        let pattern = self.config.pattern.clone();
+        let hrp = self.config.hrp.clone();
+        let path = self.config.derivation_path.clone();
+        let mnemonic_words = self.config.mnemonic_words;
+        let max_matches = self.config.max_matches;
+        let counter = Arc::clone(&self.candidates_checked);
+        let stop_flag = Arc::clone(&self.should_stop);
+        let runtime_error = Arc::clone(&self.runtime_error);
+        let matches_found = Arc::new(AtomicU64::new(self.state.matches_found));
+        let keygen_threads = self.config.num_threads.max(gpu_contexts.len());
+
+        tracing::info!(
+            "Pure GPU mode: {} keygen feeder threads across {} CUDA devices",
+            keygen_threads,
+            gpu_contexts.len(),
+        );
+
+        let (keygen_tx, keygen_rx) =
+            bounded::<(Vec<u8>, String, String)>(total_batch_size.saturating_mul(2).max(1));
+
+        for thread_id in 0..keygen_threads {
+            let keygen_tx = keygen_tx.clone();
+            let path = path.clone();
+            let stop_flag = Arc::clone(&stop_flag);
+            let matches_found = Arc::clone(&matches_found);
+
+            std::thread::Builder::new()
+                .name(format!("gpu-keygen-{thread_id}"))
+                .spawn(move || {
+                    tracing::debug!("Pure GPU keygen worker {thread_id} started");
+
+                    loop {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if max_matches > 0
+                            && matches_found.load(Ordering::Relaxed) >= max_matches as u64
+                        {
+                            break;
+                        }
+
+                        let key = match generate_random_keypair_with_words(&path, mnemonic_words) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                tracing::error!("Keygen error: {e}");
+                                continue;
+                            }
+                        };
+
+                        let pubkey = key.public_key_bytes().to_vec();
+                        let mnemonic = key.mnemonic().to_string();
+                        let deriv_path = key.derivation_path().to_string();
+                        drop(key);
+
+                        if keygen_tx.send((pubkey, mnemonic, deriv_path)).is_err() {
+                            break;
+                        }
+                    }
+
+                    tracing::debug!("Pure GPU keygen worker {thread_id} exited");
+                })?;
+        }
+
+        drop(keygen_tx);
+
+        for (gpu_ctx, batch_size) in gpu_contexts.into_iter().zip(batch_sizes.into_iter()) {
+            let keygen_rx = keygen_rx.clone();
+            let gpu_result_tx = result_tx.clone();
+            let gpu_counter = Arc::clone(&counter);
+            let gpu_stop = Arc::clone(&stop_flag);
+            let gpu_matches = Arc::clone(&matches_found);
+            let runtime_error = Arc::clone(&runtime_error);
+            let gpu_pattern = pattern.clone();
+            let gpu_hrp = hrp.clone();
+
+            std::thread::Builder::new()
+                .name(format!("cuda-pure-{}", gpu_ctx.device_index()))
+                .spawn(move || {
+                    tracing::debug!(
+                        "Pure CUDA worker {} started on {}",
+                        gpu_ctx.device_index(),
+                        gpu_ctx.device_name(),
+                    );
+
+                    let mut batch = KeyBatch::with_capacity(batch_size);
+
+                    loop {
+                        if gpu_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if max_matches > 0
+                            && gpu_matches.load(Ordering::Relaxed) >= max_matches as u64
+                        {
+                            break;
+                        }
+                        if !fill_batch(
+                            &keygen_rx,
+                            &mut batch,
+                            batch_size,
+                            &gpu_stop,
+                            &gpu_matches,
+                            max_matches,
+                        ) {
+                            break;
+                        }
+
+                        let actual_batch = batch.mnemonics.len();
+                        if actual_batch == 0 {
+                            continue;
+                        }
+
+                        let hashes = match gpu_ctx.hash_pubkeys_batch(&batch.pubkeys) {
+                            Ok(hashes) => hashes,
+                            Err(e) => {
+                                batch.clear();
+                                record_runtime_error(
+                                    &runtime_error,
+                                    &gpu_stop,
+                                    format!(
+                                        "CUDA device {} failed during pure GPU execution: {e}",
+                                        format_cuda_context_label(&gpu_ctx)
+                                    ),
+                                );
+                                break;
+                            }
+                        };
+
+                        let batch_start =
+                            gpu_counter.fetch_add(actual_batch as u64, Ordering::Relaxed);
+
+                        for i in 0..actual_batch {
+                            let hash_bytes: [u8; 20] =
+                                hashes[i * 20..(i + 1) * 20].try_into().expect("20 bytes");
+
+                            let address = match encode_bech32(&gpu_hrp, &hash_bytes) {
+                                Ok(address) => address,
+                                Err(_) => continue,
+                            };
+
+                            if gpu_pattern.matches(&address, &gpu_hrp) {
+                                let candidate_num = batch_start + i as u64;
+                                let elapsed = start.elapsed().as_secs_f64();
+                                tracing::info!(
+                                    "🎯 GPU Match found! Address: {} (candidate #{})",
+                                    address,
+                                    candidate_num
+                                );
+
+                                gpu_matches.fetch_add(1, Ordering::Relaxed);
+
+                                let result = SearchResult {
+                                    address,
+                                    mnemonic: batch.mnemonics[i].clone(),
+                                    derivation_path: batch.paths[i].clone(),
+                                    candidate_number: candidate_num,
+                                    elapsed_secs: elapsed,
+                                    private_key_hex: None,
+                                };
+
+                                if gpu_result_tx.send(result).is_err() {
+                                    batch.clear();
+                                    return;
+                                }
+                            }
+                        }
+
+                        batch.clear();
+                    }
+
+                    batch.clear();
+                    tracing::debug!("Pure CUDA worker {} exited", gpu_ctx.device_index());
+                })?;
+        }
+
+        drop(result_tx);
+        Ok(result_rx)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn search_gpu_raw_multi_cuda(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
+        use rand::RngCore;
+
+        let gpu_contexts = self.selected_cuda_contexts()?;
+        let missing_kernel = gpu_contexts
+            .iter()
+            .filter(|ctx| !ctx.has_secp256k1_kernel())
+            .map(format_cuda_context_label)
+            .collect::<Vec<_>>();
+        if !missing_kernel.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Raw secp256k1 CUDA kernel is unavailable on requested devices: {}",
+                missing_kernel.join(", ")
+            ));
+        }
+
+        let batch_sizes = gpu_contexts
+            .iter()
+            .map(|ctx| ctx.pure_gpu_batch_size())
+            .collect::<Vec<_>>();
+
+        tracing::info!(
+            "Starting multi-CUDA raw search on {} device(s): {}",
+            gpu_contexts.len(),
+            gpu_contexts
+                .iter()
+                .zip(batch_sizes.iter())
+                .map(|(ctx, batch_size)| {
+                    format!("{} batch={}", format_cuda_context_label(ctx), batch_size)
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+
+        self.config.pattern.validate_bech32_charset()?;
+
+        let (result_tx, result_rx) = bounded::<SearchResult>(32);
+        let start = Instant::now();
+        let pattern = self.config.pattern.clone();
+        let hrp = self.config.hrp.clone();
+        let max_matches = self.config.max_matches;
+        let counter = Arc::clone(&self.candidates_checked);
+        let stop_flag = Arc::clone(&self.should_stop);
+        let runtime_error = Arc::clone(&self.runtime_error);
+        let matches_found = Arc::new(AtomicU64::new(self.state.matches_found));
+
+        tracing::info!(
+            "Raw GPU mode: {} CUDA devices generating random privkeys independently",
+            batch_sizes.len(),
+        );
+
+        for (gpu_ctx, batch_size) in gpu_contexts.into_iter().zip(batch_sizes.into_iter()) {
+            let gpu_result_tx = result_tx.clone();
+            let gpu_counter = Arc::clone(&counter);
+            let gpu_stop = Arc::clone(&stop_flag);
+            let gpu_matches = Arc::clone(&matches_found);
+            let runtime_error = Arc::clone(&runtime_error);
+            let gpu_pattern = pattern.clone();
+            let gpu_hrp = hrp.clone();
+
+            std::thread::Builder::new()
+                .name(format!("cuda-raw-{}", gpu_ctx.device_index()))
+                .spawn(move || {
+                    tracing::debug!(
+                        "Raw CUDA worker {} started on {}",
+                        gpu_ctx.device_index(),
+                        gpu_ctx.device_name(),
+                    );
+                    let mut rng = rand::rngs::OsRng;
+
+                    loop {
+                        if gpu_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if max_matches > 0
+                            && gpu_matches.load(Ordering::Relaxed) >= max_matches as u64
+                        {
+                            break;
+                        }
+
+                        let mut privkeys = vec![0u8; batch_size * 32];
+                        rng.fill_bytes(&mut privkeys);
+
+                        let (_pubkeys, hashes, _matches) =
+                            match gpu_ctx.generate_and_hash_batch(&privkeys, &[]) {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    privkeys.zeroize();
+                                    record_runtime_error(
+                                        &runtime_error,
+                                        &gpu_stop,
+                                        format!(
+                                            "CUDA device {} failed during raw execution: {e}",
+                                            format_cuda_context_label(&gpu_ctx)
+                                        ),
+                                    );
+                                    break;
+                                }
+                            };
+
+                        let batch_start =
+                            gpu_counter.fetch_add(batch_size as u64, Ordering::Relaxed);
+
+                        for i in 0..batch_size {
+                            let hash_bytes: [u8; 20] =
+                                hashes[i * 20..(i + 1) * 20].try_into().expect("20 bytes");
+
+                            let address = match encode_bech32(&gpu_hrp, &hash_bytes) {
+                                Ok(address) => address,
+                                Err(_) => continue,
+                            };
+
+                            if gpu_pattern.matches(&address, &gpu_hrp) {
+                                let candidate_num = batch_start + i as u64;
+                                let elapsed = start.elapsed().as_secs_f64();
+                                let privkey_hex =
+                                    format!("0x{}", hex::encode(&privkeys[i * 32..(i + 1) * 32]));
+
+                                tracing::info!(
+                                    "🎯 GPU Raw Match! Address: {} (candidate #{})",
+                                    address,
+                                    candidate_num
+                                );
+
+                                gpu_matches.fetch_add(1, Ordering::Relaxed);
+
+                                let result = SearchResult {
+                                    address,
+                                    mnemonic: String::new(),
+                                    derivation_path: String::new(),
+                                    candidate_number: candidate_num,
+                                    elapsed_secs: elapsed,
+                                    private_key_hex: Some(privkey_hex),
+                                };
+
+                                if gpu_result_tx.send(result).is_err() {
+                                    privkeys.zeroize();
+                                    return;
+                                }
+                            }
+                        }
+
+                        privkeys.zeroize();
+                    }
+
+                    tracing::debug!("Raw CUDA worker {} exited", gpu_ctx.device_index());
+                })?;
+        }
+
+        drop(result_tx);
+        Ok(result_rx)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn search_gpu_mnemonic_multi_cuda(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
+        use cosmos_vanity_keyderiv::bip39::Mnemonic;
+
+        let derivation_path = self.config.derivation_path.clone();
+        if derivation_path != cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH {
+            return Err(anyhow::anyhow!(
+            "GPU mnemonic pipeline only supports the default Cosmos derivation path {};                  use CPU-derived GPU hashing or CPU mode for custom path {}",
+            cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH,
+            derivation_path
+        ));
+        }
+
+        let gpu_contexts = self.selected_cuda_contexts()?;
+        let missing_kernel = gpu_contexts
+            .iter()
+            .filter(|ctx| !ctx.has_mnemonic_kernel())
+            .map(format_cuda_context_label)
+            .collect::<Vec<_>>();
+        if !missing_kernel.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Mnemonic CUDA pipeline kernel is unavailable on requested devices: {}",
+                missing_kernel.join(", ")
+            ));
+        }
+
+        let batch_sizes = gpu_contexts
+            .iter()
+            .map(|ctx| ctx.mnemonic_batch_size())
+            .collect::<Vec<_>>();
+        let total_batch_size = batch_sizes.iter().sum::<usize>().max(1);
+
+        tracing::info!(
+            "Starting multi-CUDA mnemonic search on {} device(s): {}",
+            gpu_contexts.len(),
+            gpu_contexts
+                .iter()
+                .zip(batch_sizes.iter())
+                .map(|(ctx, batch_size)| {
+                    format!("{} batch={}", format_cuda_context_label(ctx), batch_size)
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+
+        self.config.pattern.validate_bech32_charset()?;
+
+        let (result_tx, result_rx) = bounded::<SearchResult>(32);
+        let start = Instant::now();
+        let pattern = self.config.pattern.clone();
+        let hrp = self.config.hrp.clone();
+        let max_matches = self.config.max_matches;
+        let counter = Arc::clone(&self.candidates_checked);
+        let stop_flag = Arc::clone(&self.should_stop);
+        let runtime_error = Arc::clone(&self.runtime_error);
+        let matches_found = Arc::new(AtomicU64::new(self.state.matches_found));
+        let generator_threads = self.config.num_threads.max(gpu_contexts.len());
+
+        tracing::info!(
+            "GPU mnemonic mode: {} mnemonic generator threads feeding {} CUDA devices",
+            generator_threads,
+            gpu_contexts.len(),
+        );
+
+        let (mnem_tx, mnem_rx) =
+            bounded::<(Vec<u8>, String)>(total_batch_size.saturating_mul(2).max(1));
+
+        let mnemonic_words = self.config.mnemonic_words;
+        for thread_id in 0..generator_threads {
+            let mnem_tx = mnem_tx.clone();
+            let stop_flag = Arc::clone(&stop_flag);
+            let matches_found = Arc::clone(&matches_found);
+
+            std::thread::Builder::new()
+                .name(format!("mnem-gen-{thread_id}"))
+                .spawn(move || loop {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if max_matches > 0
+                        && matches_found.load(Ordering::Relaxed) >= max_matches as u64
+                    {
+                        break;
+                    }
+
+                    let entropy_len = if mnemonic_words == 12 { 16 } else { 32 };
+                    let mut entropy = [0u8; 32];
+                    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy[..entropy_len]);
+                    let mnemonic: Mnemonic = match Mnemonic::from_entropy(&entropy[..entropy_len]) {
+                        Ok(mnemonic) => mnemonic,
+                        Err(_) => continue,
+                    };
+                    let mnemonic_str = mnemonic.to_string();
+                    let mnemonic_bytes = mnemonic_str.as_bytes().to_vec();
+
+                    if mnem_tx.send((mnemonic_bytes, mnemonic_str)).is_err() {
+                        break;
+                    }
+                })?;
+        }
+        drop(mnem_tx);
+
+        for (gpu_ctx, batch_size) in gpu_contexts.into_iter().zip(batch_sizes.into_iter()) {
+            let mnem_rx = mnem_rx.clone();
+            let result_tx = result_tx.clone();
+            let counter = Arc::clone(&counter);
+            let stop_flag = Arc::clone(&stop_flag);
+            let matches_found = Arc::clone(&matches_found);
+            let runtime_error = Arc::clone(&runtime_error);
+            let pattern = pattern.clone();
+            let hrp = hrp.clone();
+            let derivation_path = derivation_path.clone();
+
+            std::thread::Builder::new()
+                .name(format!("cuda-mnemonic-{}", gpu_ctx.device_index()))
+                .spawn(move || {
+                    tracing::debug!(
+                        "Mnemonic CUDA worker {} started on {}",
+                        gpu_ctx.device_index(),
+                        gpu_ctx.device_name(),
+                    );
+
+                    let mut batch_mnemonics_flat: Vec<u8> = Vec::with_capacity(batch_size * 256);
+                    let mut batch_lens: Vec<u32> = Vec::with_capacity(batch_size);
+                    let mut batch_strings: Vec<String> = Vec::with_capacity(batch_size);
+
+                    loop {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if max_matches > 0
+                            && matches_found.load(Ordering::Relaxed) >= max_matches as u64
+                        {
+                            break;
+                        }
+                        if !fill_mnemonic_batch(
+                            &mnem_rx,
+                            &mut batch_mnemonics_flat,
+                            &mut batch_lens,
+                            &mut batch_strings,
+                            batch_size,
+                            &stop_flag,
+                            &matches_found,
+                            max_matches,
+                        ) {
+                            break;
+                        }
+
+                        let actual_batch = batch_lens.len();
+                        if actual_batch == 0 {
+                            continue;
+                        }
+
+                        let (hashes, _matches) =
+                            match gpu_ctx.mnemonic_batch(&batch_mnemonics_flat, &batch_lens) {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    record_runtime_error(
+                                        &runtime_error,
+                                        &stop_flag,
+                                        format!(
+                                            "CUDA device {} failed during mnemonic execution: {e}",
+                                            format_cuda_context_label(&gpu_ctx)
+                                        ),
+                                    );
+                                    break;
+                                }
+                            };
+
+                        let batch_start = counter.fetch_add(actual_batch as u64, Ordering::Relaxed);
+
+                        for i in 0..actual_batch {
+                            let hash_bytes: [u8; 20] =
+                                hashes[i * 20..(i + 1) * 20].try_into().expect("20 bytes");
+
+                            let address = match encode_bech32(&hrp, &hash_bytes) {
+                                Ok(address) => address,
+                                Err(_) => continue,
+                            };
+
+                            if pattern.matches(&address, &hrp) {
+                                let candidate_num = batch_start + i as u64;
+                                let elapsed = start.elapsed().as_secs_f64();
+                                tracing::info!(
+                                    "🎯 GPU Mnemonic Match! Address: {} (candidate #{})",
+                                    address,
+                                    candidate_num
+                                );
+
+                                matches_found.fetch_add(1, Ordering::Relaxed);
+
+                                let result = SearchResult {
+                                    address,
+                                    mnemonic: batch_strings[i].clone(),
+                                    derivation_path: derivation_path.clone(),
+                                    candidate_number: candidate_num,
+                                    elapsed_secs: elapsed,
+                                    private_key_hex: None,
+                                };
+
+                                if result_tx.send(result).is_err() {
+                                    batch_mnemonics_flat.zeroize();
+                                    batch_mnemonics_flat.clear();
+                                    batch_lens.clear();
+                                    zeroize_string_vec(&mut batch_strings);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    batch_mnemonics_flat.zeroize();
+                    batch_mnemonics_flat.clear();
+                    batch_lens.clear();
+                    zeroize_string_vec(&mut batch_strings);
+                    tracing::debug!("Mnemonic CUDA worker {} exited", gpu_ctx.device_index());
+                })?;
+        }
+
+        drop(result_tx);
+        Ok(result_rx)
+    }
+
     /// Save current state to the configured state file.
     pub fn save_state(&mut self) -> anyhow::Result<()> {
         if let Some(ref path) = self.config.state_file {
@@ -1316,6 +2302,105 @@ fn fill_batch(
     true
 }
 
+#[cfg(feature = "cuda")]
+fn format_cuda_context_label(ctx: &crate::cuda::GpuContext) -> String {
+    let cc = ctx
+        .compute_capability()
+        .map(|(major, minor)| format!(", cc {major}.{minor}"))
+        .unwrap_or_default();
+    format!(
+        "[{}] {}{} (SMs: {})",
+        ctx.device_index(),
+        ctx.device_name(),
+        cc,
+        ctx.max_compute_units(),
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn record_runtime_error(
+    runtime_error: &Arc<Mutex<Option<String>>>,
+    stop_flag: &Arc<AtomicBool>,
+    message: String,
+) {
+    {
+        let mut slot = runtime_error.lock().expect("runtime error mutex poisoned");
+        if slot.is_none() {
+            *slot = Some(message.clone());
+        }
+    }
+
+    tracing::error!("{message}");
+    stop_flag.store(true, Ordering::Relaxed);
+}
+
+#[cfg(feature = "cuda")]
+fn push_mnemonic_batch_item(
+    batch_mnemonics_flat: &mut Vec<u8>,
+    batch_lens: &mut Vec<u32>,
+    batch_strings: &mut Vec<String>,
+    mut bytes: Vec<u8>,
+    string: String,
+) {
+    let mut padded = vec![0u8; 256];
+    let len = bytes.len().min(256);
+    padded[..len].copy_from_slice(&bytes[..len]);
+    batch_mnemonics_flat.extend_from_slice(&padded);
+    bytes.zeroize();
+    padded.zeroize();
+    batch_lens.push(len as u32);
+    batch_strings.push(string);
+}
+
+#[cfg(feature = "cuda")]
+fn fill_mnemonic_batch(
+    mnem_rx: &Receiver<(Vec<u8>, String)>,
+    batch_mnemonics_flat: &mut Vec<u8>,
+    batch_lens: &mut Vec<u32>,
+    batch_strings: &mut Vec<String>,
+    batch_size: usize,
+    stop_flag: &Arc<AtomicBool>,
+    matches_found: &Arc<AtomicU64>,
+    max_matches: usize,
+) -> bool {
+    batch_mnemonics_flat.zeroize();
+    batch_mnemonics_flat.clear();
+    batch_lens.clear();
+    zeroize_string_vec(batch_strings);
+
+    match mnem_rx.recv() {
+        Ok((bytes, string)) => push_mnemonic_batch_item(
+            batch_mnemonics_flat,
+            batch_lens,
+            batch_strings,
+            bytes,
+            string,
+        ),
+        Err(_) => return false,
+    }
+
+    while batch_lens.len() < batch_size {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        if max_matches > 0 && matches_found.load(Ordering::Relaxed) >= max_matches as u64 {
+            break;
+        }
+        match mnem_rx.try_recv() {
+            Ok((bytes, string)) => push_mnemonic_batch_item(
+                batch_mnemonics_flat,
+                batch_lens,
+                batch_strings,
+                bytes,
+                string,
+            ),
+            Err(_) => break,
+        }
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,6 +2412,17 @@ mod tests {
         assert!(config.num_threads > 0);
         assert_eq!(config.max_matches, 1);
         assert_eq!(config.mode, SearchMode::Cpu);
+        assert!(config.gpu_devices.is_default());
+    }
+
+    #[test]
+    fn test_gpu_device_selection_display() {
+        assert_eq!(GpuDeviceSelection::default().to_string(), "default");
+        assert_eq!(GpuDeviceSelection::All.to_string(), "all");
+        assert_eq!(
+            GpuDeviceSelection::Indices(vec![0, 2, 5]).to_string(),
+            "0,2,5"
+        );
     }
 
     #[test]
@@ -1368,6 +2464,7 @@ mod tests {
             mode: SearchMode::Gpu,
             key_mode: KeyMode::Mnemonic,
             gpu_api: GpuApi::Auto,
+            gpu_devices: GpuDeviceSelection::default(),
             mnemonic_words: 12,
             max_matches: 1,
             checkpoint_interval: 1000,
@@ -1395,6 +2492,7 @@ mod tests {
             mode: SearchMode::Cpu,
             key_mode: KeyMode::Mnemonic,
             gpu_api: GpuApi::Auto,
+            gpu_devices: GpuDeviceSelection::default(),
             mnemonic_words: 12,
             max_matches: 1,
             checkpoint_interval: 1000,

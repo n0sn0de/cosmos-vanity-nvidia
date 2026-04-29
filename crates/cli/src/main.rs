@@ -15,7 +15,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use cosmos_vanity_address::VanityPattern;
-use cosmos_vanity_gpu::{GpuApi, KeyMode, SearchConfig, SearchMode, VanitySearcher};
+use cosmos_vanity_gpu::{
+    GpuApi, GpuDeviceSelection, KeyMode, SearchConfig, SearchMode, VanitySearcher,
+};
 use cosmos_vanity_verify::verify_match;
 
 /// Cosmos Vanity Address Generator — GPU accelerated
@@ -44,8 +46,12 @@ enum Commands {
     /// Search for a vanity address
     Search {
         /// Pattern to search for
-        #[arg(short, long)]
-        pattern: String,
+        #[arg(short, long, required_unless_present = "list_gpus")]
+        pattern: Option<String>,
+
+        /// Print visible CUDA GPUs and exit
+        #[arg(long)]
+        list_gpus: bool,
 
         /// Pattern match type
         #[arg(short = 't', long, default_value = "prefix")]
@@ -70,6 +76,10 @@ enum Commands {
         /// GPU backend API: auto (prefer CUDA, then OpenCL), opencl, or cuda
         #[arg(long, default_value = "auto")]
         gpu_api: GpuApiArg,
+
+        /// CUDA device selection: all or a comma-separated list like 0,1,3
+        #[arg(long, value_parser = parse_gpu_devices)]
+        gpu_devices: Option<GpuDeviceSelection>,
 
         /// Key mode: raw (fast, privkey only) or mnemonic (BIP-39 compatible)
         #[arg(short = 'k', long, default_value = "raw")]
@@ -165,7 +175,6 @@ enum SearchModeArg {
 }
 
 impl SearchModeArg {
-    #[cfg(any(feature = "opencl", feature = "cuda"))]
     fn to_search_mode(&self) -> SearchMode {
         match self {
             SearchModeArg::Gpu => SearchMode::Gpu,
@@ -234,6 +243,39 @@ fn parse_mnemonic_words(value: &str) -> std::result::Result<u8, String> {
     }
 }
 
+fn parse_gpu_devices(value: &str) -> std::result::Result<GpuDeviceSelection, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("GPU device list cannot be empty".to_string());
+    }
+
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(GpuDeviceSelection::All);
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut indices = Vec::new();
+
+    for part in trimmed.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            return Err("GPU device list contains an empty entry".to_string());
+        }
+
+        let index = token
+            .parse::<usize>()
+            .map_err(|e| format!("invalid GPU device index '{token}': {e}"))?;
+
+        if !seen.insert(index) {
+            return Err(format!("duplicate GPU device index: {index}"));
+        }
+
+        indices.push(index);
+    }
+
+    Ok(GpuDeviceSelection::Indices(indices))
+}
+
 struct SecretSink {
     path: PathBuf,
     writer: BufWriter<File>,
@@ -299,12 +341,14 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Search {
             pattern,
+            list_gpus,
             match_type,
             hrp,
             path,
             threads,
             mode,
             gpu_api,
+            gpu_devices,
             key_mode,
             max_matches,
             state_file,
@@ -312,6 +356,13 @@ fn main() -> Result<()> {
             secret_output_file,
             words,
         } => {
+            if list_gpus {
+                return print_cuda_gpus(cli.format);
+            }
+
+            validate_cuda_device_request(&mode, &gpu_api, gpu_devices.as_ref())?;
+
+            let pattern = pattern.expect("clap requires a pattern unless --list-gpus is used");
             let vanity_pattern = match match_type {
                 MatchType::Prefix => VanityPattern::Prefix(pattern),
                 MatchType::Suffix => VanityPattern::Suffix(pattern),
@@ -324,12 +375,13 @@ fn main() -> Result<()> {
                 .validate_bech32_charset()
                 .context("Invalid pattern")?;
 
+            let strict_gpu = gpu_devices.is_some();
             let gpu_api = gpu_api.to_gpu_api();
             #[cfg(any(feature = "opencl", feature = "cuda"))]
             let requested_path_is_default = path == cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH;
 
             // Determine effective mode — fall back from GPU/hybrid to CPU if no compatible GPU backend is available.
-            let effective_mode = resolve_mode(&mode, gpu_api);
+            let effective_mode = resolve_mode(&mode, gpu_api, strict_gpu);
 
             let effective_key_mode = key_mode.to_key_mode();
 
@@ -349,6 +401,7 @@ fn main() -> Result<()> {
                 mode: effective_mode,
                 key_mode: effective_key_mode,
                 gpu_api,
+                gpu_devices: gpu_devices.unwrap_or_default(),
                 max_matches,
                 checkpoint_interval,
                 mnemonic_words: words,
@@ -373,6 +426,9 @@ fn main() -> Result<()> {
             println!("   Key mode: {effective_key_mode}");
             if effective_mode != SearchMode::Cpu {
                 println!("   GPU API:  {gpu_api}");
+                if gpu_api == GpuApi::Cuda && !config.gpu_devices.is_default() {
+                    println!("   GPU devs: {}", config.gpu_devices);
+                }
             }
             if effective_key_mode == KeyMode::Mnemonic {
                 println!("   Words:    {words}");
@@ -426,6 +482,9 @@ fn main() -> Result<()> {
                             match searcher.search_gpu_pure() {
                                 Ok(rx) => rx,
                                 Err(e) => {
+                                    if strict_gpu {
+                                        anyhow::bail!("GPU init failed ({e})");
+                                    }
                                     eprintln!("⚠️  GPU init failed ({e}), falling back to CPU");
                                     searcher.search_cpu()?
                                 }
@@ -435,10 +494,17 @@ fn main() -> Result<()> {
                             match searcher.search_gpu_mnemonic() {
                                 Ok(rx) => rx,
                                 Err(e) => {
-                                    eprintln!("⚠️  GPU mnemonic pipeline failed ({e}), falling back to CPU mnemonic GPU mode");
+                                    eprintln!(
+                                        "⚠️  GPU mnemonic pipeline failed ({e}), trying CPU-derived GPU mnemonic mode"
+                                    );
                                     match searcher.search_gpu_pure() {
                                         Ok(rx) => rx,
                                         Err(e2) => {
+                                            if strict_gpu {
+                                                anyhow::bail!(
+                                                    "GPU mnemonic pipeline failed ({e}); GPU fallback init failed ({e2})"
+                                                );
+                                            }
                                             eprintln!(
                                                 "⚠️  GPU init failed ({e2}), falling back to CPU"
                                             );
@@ -461,6 +527,9 @@ fn main() -> Result<()> {
                         match searcher.search_hybrid() {
                             Ok(rx) => rx,
                             Err(e) => {
+                                if strict_gpu {
+                                    anyhow::bail!("GPU init failed ({e})");
+                                }
                                 eprintln!("⚠️  GPU init failed ({e}), falling back to CPU");
                                 searcher.search_cpu()?
                             }
@@ -735,6 +804,14 @@ fn main() -> Result<()> {
                 }
             }
 
+            if let Some(err) = searcher.take_runtime_error() {
+                pb.finish_and_clear();
+                if let Err(save_err) = searcher.save_state() {
+                    eprintln!("Warning: failed to save state: {save_err}");
+                }
+                return Err(anyhow::anyhow!(err));
+            }
+
             pb.finish_with_message(format!(
                 "Done! {} candidates checked, {} matches found",
                 counter.load(Ordering::Relaxed),
@@ -865,12 +942,95 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn validate_cuda_device_request(
+    mode: &SearchModeArg,
+    gpu_api: &GpuApiArg,
+    gpu_devices: Option<&GpuDeviceSelection>,
+) -> Result<()> {
+    let Some(gpu_devices) = gpu_devices else {
+        return Ok(());
+    };
+
+    if !matches!(mode, SearchModeArg::Gpu | SearchModeArg::Hybrid) {
+        anyhow::bail!("--gpu-devices requires GPU search mode (--mode gpu or --mode hybrid)");
+    }
+
+    if !matches!(gpu_api, GpuApiArg::Cuda) {
+        anyhow::bail!("--gpu-devices requires --gpu-api cuda");
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        let _ = gpu_devices;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = gpu_devices;
+        Err(anyhow::anyhow!(
+            "--gpu-devices requires CUDA support compiled in via --features cuda"
+        ))
+    }
+}
+
+fn print_cuda_gpus(format: OutputFormat) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let devices =
+            cosmos_vanity_gpu::cuda::list_devices().context("failed to enumerate CUDA devices")?;
+
+        match format {
+            OutputFormat::Text => {
+                if devices.is_empty() {
+                    println!("No CUDA GPUs visible.");
+                } else {
+                    println!("Visible CUDA GPUs:");
+                    for device in devices {
+                        let cc = device
+                            .compute_capability
+                            .map(|(major, minor)| format!(" | cc {major}.{minor}"))
+                            .unwrap_or_default();
+                        println!(
+                            "  [{}] {}{} | SMs {}",
+                            device.index, device.name, cc, device.max_compute_units
+                        );
+                    }
+                }
+            }
+            OutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&devices.iter().map(|device| serde_json::json!({
+                        "index": device.index,
+                        "name": &device.name,
+                        "compute_capability": device.compute_capability.map(|(major, minor)| format!("{major}.{minor}")),
+                        "sm_count": device.max_compute_units,
+                    })).collect::<Vec<_>>())?
+                );
+            }
+        }
+
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = format;
+        anyhow::bail!("CUDA support not compiled in. Rebuild with --features cuda");
+    }
+}
+
 /// Resolve the requested search mode to an effective mode.
-/// Falls back from GPU/hybrid to CPU if no compatible GPU backend is available.
-fn resolve_mode(requested: &SearchModeArg, _gpu_api: GpuApi) -> SearchMode {
+/// Falls back from GPU/hybrid to CPU if no compatible GPU backend is available,
+/// unless the user explicitly requested CUDA device indices.
+fn resolve_mode(requested: &SearchModeArg, _gpu_api: GpuApi, strict_gpu: bool) -> SearchMode {
     match requested {
         SearchModeArg::Cpu => SearchMode::Cpu,
         SearchModeArg::Gpu | SearchModeArg::Hybrid => {
+            if strict_gpu {
+                return requested.to_search_mode();
+            }
+
             #[cfg(any(feature = "opencl", feature = "cuda"))]
             {
                 if cosmos_vanity_gpu::is_gpu_api_available(_gpu_api) {
@@ -1093,5 +1253,66 @@ mod tests {
             }
             _ => panic!("expected verify command"),
         }
+    }
+
+    #[test]
+    fn parse_gpu_devices_accepts_all_and_index_lists() {
+        assert_eq!(parse_gpu_devices("all").unwrap(), GpuDeviceSelection::All);
+        assert_eq!(
+            parse_gpu_devices("0, 2,5").unwrap(),
+            GpuDeviceSelection::Indices(vec![0, 2, 5])
+        );
+    }
+
+    #[test]
+    fn parse_gpu_devices_rejects_duplicates() {
+        let err = parse_gpu_devices("1,1").unwrap_err();
+        assert!(err.contains("duplicate GPU device index"));
+    }
+
+    #[test]
+    fn search_allows_list_gpus_without_pattern() {
+        let cli = Cli::try_parse_from(["cosmos-vanity", "search", "--list-gpus"]).unwrap();
+
+        match cli.command {
+            Commands::Search {
+                pattern, list_gpus, ..
+            } => {
+                assert!(list_gpus);
+                assert!(pattern.is_none());
+            }
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn validate_cuda_device_request_requires_cuda_gpu_mode() {
+        let err = validate_cuda_device_request(
+            &SearchModeArg::Gpu,
+            &GpuApiArg::Auto,
+            Some(&GpuDeviceSelection::All),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("requires --gpu-api cuda"));
+
+        let err = validate_cuda_device_request(
+            &SearchModeArg::Cpu,
+            &GpuApiArg::Cuda,
+            Some(&GpuDeviceSelection::All),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("requires GPU search mode"));
+    }
+
+    #[test]
+    fn resolve_mode_keeps_explicit_gpu_requests_strict() {
+        assert_eq!(
+            resolve_mode(&SearchModeArg::Gpu, GpuApi::Cuda, true),
+            SearchMode::Gpu
+        );
+        assert_eq!(
+            resolve_mode(&SearchModeArg::Hybrid, GpuApi::Cuda, true),
+            SearchMode::Hybrid
+        );
     }
 }

@@ -9,9 +9,10 @@ use std::{
     ffi::{c_char, c_int, CStr, CString},
     fs,
     mem::MaybeUninit,
+    panic::{self, AssertUnwindSafe},
     process::Command,
     ptr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -81,10 +82,20 @@ type NvrtcGetCubinSize =
     unsafe extern "C" fn(nvrtc_sys::nvrtcProgram, *mut usize) -> nvrtc_sys::nvrtcResult;
 type NvrtcGetErrorString = unsafe extern "C" fn(nvrtc_sys::nvrtcResult) -> *const c_char;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaDeviceInfo {
+    pub index: usize,
+    pub name: String,
+    pub compute_capability: Option<(u32, u32)>,
+    pub max_compute_units: u32,
+}
+
 #[derive(Debug, Error)]
 pub enum GpuError {
     #[error("No CUDA device found")]
     NoDevice,
+    #[error("Invalid CUDA device index {requested} (visible devices: 0..{available})")]
+    InvalidDeviceIndex { requested: usize, available: usize },
     #[error("CUDA runtime unavailable: {0}")]
     RuntimeUnavailable(String),
     #[error("CUDA driver error: {0}")]
@@ -95,13 +106,87 @@ pub enum GpuError {
     InvalidBatchSize,
 }
 
+fn cuda_panic_hook_mutex() -> &'static Mutex<()> {
+    static CUDA_PANIC_HOOK_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    CUDA_PANIC_HOOK_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn catch_cuda_driver_call<T, F>(panic_message: &'static str, f: F) -> Result<T, GpuError>
+where
+    F: FnOnce() -> Result<T, DriverError>,
+{
+    let _panic_hook_guard = cuda_panic_hook_mutex()
+        .lock()
+        .expect("CUDA panic hook mutex poisoned");
+    let original_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+    let result = panic::catch_unwind(AssertUnwindSafe(f));
+    panic::set_hook(original_hook);
+
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => Err(GpuError::RuntimeUnavailable(panic_message.to_string())),
+    }
+}
+
+/// Check if CUDA acceleration is available.
+fn visible_device_count() -> Result<usize, GpuError> {
+    let count = catch_cuda_driver_call(
+        "CUDA driver library could not be loaded on this machine",
+        DriverContext::device_count,
+    )?;
+
+    Ok(count as usize)
+}
+
+pub fn list_devices() -> Result<Vec<CudaDeviceInfo>, GpuError> {
+    let device_count = visible_device_count()?;
+    if device_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut devices = Vec::with_capacity(device_count);
+    for index in 0..device_count {
+        let ctx = catch_cuda_driver_call(
+            "CUDA context creation panicked while loading the driver",
+            || DriverContext::new(index),
+        )?;
+
+        let name = ctx
+            .name()
+            .unwrap_or_else(|_| "Unknown NVIDIA GPU".to_string());
+        let compute_capability = ctx
+            .compute_capability()
+            .ok()
+            .map(|(major, minor)| (major.max(0) as u32, minor.max(0) as u32));
+        let max_compute_units = ctx
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )?
+            .max(1) as u32;
+
+        devices.push(CudaDeviceInfo {
+            index,
+            name,
+            compute_capability,
+            max_compute_units,
+        });
+    }
+
+    Ok(devices)
+}
+
 /// Check if CUDA acceleration is available.
 pub fn is_available() -> bool {
-    std::panic::catch_unwind(|| match DriverContext::device_count() {
-        Ok(count) if count > 0 => DriverContext::new(0).is_ok(),
+    match visible_device_count() {
+        Ok(count) if count > 0 => catch_cuda_driver_call(
+            "CUDA context creation panicked while loading the driver",
+            || DriverContext::new(0),
+        )
+        .is_ok(),
         _ => false,
-    })
-    .unwrap_or(false)
+    }
 }
 
 /// CUDA context holding the stream, compiled modules, and device info.
@@ -113,7 +198,9 @@ pub struct GpuContext {
     #[cfg(test)]
     mnemonic_module: Mutex<Option<Arc<CudaModule>>>,
     mnemonic_function: Mutex<Option<CudaFunction>>,
+    device_index: usize,
     device_name: String,
+    compute_capability: Option<(u32, u32)>,
     max_threads_per_block: u32,
     max_compute_units: u32,
 }
@@ -121,26 +208,34 @@ pub struct GpuContext {
 impl GpuContext {
     /// Initialize CUDA context — finds an NVIDIA GPU and compiles the kernels.
     pub fn new() -> Result<Self, GpuError> {
-        let device_count =
-            std::panic::catch_unwind(DriverContext::device_count).map_err(|_| {
-                GpuError::RuntimeUnavailable(
-                    "CUDA driver library could not be loaded on this machine".to_string(),
-                )
-            })??;
-        if device_count <= 0 {
+        Self::new_for_device(0)
+    }
+
+    pub fn new_for_device(device_index: usize) -> Result<Self, GpuError> {
+        let device_count = visible_device_count()?;
+        if device_count == 0 {
             return Err(GpuError::NoDevice);
         }
+        if device_index >= device_count {
+            return Err(GpuError::InvalidDeviceIndex {
+                requested: device_index,
+                available: device_count,
+            });
+        }
 
-        let ctx = std::panic::catch_unwind(|| DriverContext::new(0)).map_err(|_| {
-            GpuError::RuntimeUnavailable(
-                "CUDA context creation panicked while loading the driver".to_string(),
-            )
-        })??;
+        let ctx = catch_cuda_driver_call(
+            "CUDA context creation panicked while loading the driver",
+            || DriverContext::new(device_index),
+        )?;
         let stream = ctx.default_stream();
 
         let device_name = ctx
             .name()
             .unwrap_or_else(|_| "Unknown NVIDIA GPU".to_string());
+        let compute_capability = ctx
+            .compute_capability()
+            .ok()
+            .map(|(major, minor)| (major.max(0) as u32, minor.max(0) as u32));
         let max_compute_units = ctx
             .attribute(
                 cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
@@ -154,9 +249,16 @@ impl GpuContext {
         )?;
         let hash_function = hash_module.load_function("compute_address_hashes")?;
         let max_threads_per_block = hash_function.max_threads_per_block()?.max(1) as u32;
+        let compute_capability_label = compute_capability
+            .map(|(major, minor)| format!(", cc {major}.{minor}"))
+            .unwrap_or_default();
         info!(
-            "CUDA device: {} (SMs: {}, max threads/block: {})",
-            device_name, max_compute_units, max_threads_per_block
+            "CUDA device [{}]: {}{} (SMs: {}, max threads/block: {})",
+            device_index,
+            device_name,
+            compute_capability_label,
+            max_compute_units,
+            max_threads_per_block
         );
         info!("CUDA hash kernel compiled successfully");
 
@@ -168,15 +270,25 @@ impl GpuContext {
             #[cfg(test)]
             mnemonic_module: Mutex::new(None),
             mnemonic_function: Mutex::new(None),
+            device_index,
             device_name,
+            compute_capability,
             max_threads_per_block,
             max_compute_units,
         })
     }
 
+    pub fn device_index(&self) -> usize {
+        self.device_index
+    }
+
     /// Device name string.
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    pub fn compute_capability(&self) -> Option<(u32, u32)> {
+        self.compute_capability
     }
 
     /// Max compute units / SM count.

@@ -60,9 +60,21 @@ pub mod cuda {
         NotAvailable,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CudaDeviceInfo {
+        pub index: usize,
+        pub name: String,
+        pub compute_capability: Option<(u32, u32)>,
+        pub max_compute_units: u32,
+    }
+
     /// Check if CUDA GPU acceleration is available.
     pub fn is_available() -> bool {
         false
+    }
+
+    pub fn list_devices() -> Result<Vec<CudaDeviceInfo>, GpuError> {
+        Err(GpuError::NotAvailable)
     }
 
     /// Placeholder CUDA context.
@@ -72,13 +84,19 @@ pub mod cuda {
         pub fn new() -> Result<Self, GpuError> {
             Err(GpuError::NotAvailable)
         }
+
+        pub fn new_for_device(_device_index: usize) -> Result<Self, GpuError> {
+            Err(GpuError::NotAvailable)
+        }
     }
 }
 
 #[cfg(all(test, feature = "cuda"))]
 pub(crate) mod backend_tests;
 
-pub use search::{GpuApi, KeyMode, SearchConfig, SearchMode, SearchResult, VanitySearcher};
+pub use search::{
+    GpuApi, GpuDeviceSelection, KeyMode, SearchConfig, SearchMode, SearchResult, VanitySearcher,
+};
 pub use state::SearchState;
 
 /// Returns true if the requested GPU API is available on this machine.

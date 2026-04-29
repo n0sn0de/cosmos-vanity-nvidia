@@ -108,8 +108,20 @@ If the binary logs `nvcc fatal   : Cannot find compiler 'cl.exe' in PATH` while 
 ## Usage
 
 ```bash
-# force CUDA raw mode on NVIDIA
+# list visible CUDA GPUs and exit
+cosmos-vanity search --list-gpus --format json
+
+# force CUDA raw mode on the default single GPU (backward-compatible behavior)
 cosmos-vanity search -p abc --gpu-api cuda -m gpu -k raw
+
+# pin CUDA to one device explicitly
+cosmos-vanity search -p abc --gpu-api cuda -m gpu -k raw --gpu-devices 0
+
+# fan one raw search across every visible NVIDIA GPU
+cosmos-vanity search -p abc --gpu-api cuda -m gpu -k raw --gpu-devices all
+
+# select a mixed subset of GPUs explicitly
+cosmos-vanity search -p abc --gpu-api cuda -m hybrid -k mnemonic -w 12 --gpu-devices 0,1,3
 
 # full mnemonic pipeline on CUDA
 cosmos-vanity search -p abc --gpu-api cuda -m gpu -k mnemonic -w 12
@@ -127,6 +139,10 @@ cosmos-vanity verify --mnemonic-file ./mnemonic.txt --address cosmos1...
 # opt into printing wallet secrets to stdout (unsafe)
 cosmos-vanity generate --unsafe-print-secrets
 ```
+
+Notes:
+- `--gpu-devices` is CUDA-only and requires `--gpu-api cuda` plus `--mode gpu` or `--mode hybrid`
+- omitting `--gpu-devices` keeps the old single-GPU CUDA default
 
 ## Validation commands
 
