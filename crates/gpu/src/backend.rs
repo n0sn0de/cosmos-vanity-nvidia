@@ -222,7 +222,7 @@ impl ActiveGpuContext {
         &self,
         mnemonics_flat: &[u8],
         mnemonic_lens: &[u32],
-    ) -> anyhow::Result<(Vec<u8>, Vec<u8>, Vec<u32>)> {
+    ) -> anyhow::Result<(Vec<u8>, Vec<u32>)> {
         match self {
             #[cfg(feature = "cuda")]
             Self::Cuda(ctx) => ctx

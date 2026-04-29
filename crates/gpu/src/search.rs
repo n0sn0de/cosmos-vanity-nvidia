@@ -1172,8 +1172,9 @@ impl VanitySearcher {
                         continue;
                     }
 
-                    // Dispatch to GPU
-                    let (mut privkeys, hashes, _matches) =
+                    // Dispatch to GPU. The mnemonic GPU API returns only address hashes and
+                    // match flags; derived private keys stay off host RAM.
+                    let (hashes, _matches) =
                         match gpu_ctx.mnemonic_batch(&batch_mnemonics_flat, &batch_lens) {
                             Ok(r) => r,
                             Err(e) => {
@@ -1216,13 +1217,10 @@ impl VanitySearcher {
                             };
 
                             if result_tx.send(result).is_err() {
-                                privkeys.zeroize();
                                 return;
                             }
                         }
                     }
-
-                    privkeys.zeroize();
                 }
             })?;
 

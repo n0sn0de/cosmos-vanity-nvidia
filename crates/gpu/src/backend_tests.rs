@@ -12,7 +12,7 @@ pub(crate) trait BackendHarness {
         &self,
         mnemonics_flat: &[u8],
         mnemonic_lens: &[u32],
-    ) -> anyhow::Result<(Vec<u8>, Vec<u8>, Vec<u32>)>;
+    ) -> anyhow::Result<(Vec<u8>, Vec<u32>)>;
 }
 
 pub(crate) fn assert_hash_matches_cpu<B: BackendHarness>(ctx: &B) {
@@ -171,7 +171,7 @@ pub(crate) fn assert_mnemonic_pipeline<B: BackendHarness>(ctx: &B) {
     let mut padded = vec![0u8; 256];
     padded[..mnemonic_bytes.len()].copy_from_slice(mnemonic_bytes);
 
-    let (privkeys, hashes, _matches) = ctx
+    let (hashes, _matches) = ctx
         .mnemonic_batch(&padded, &[mnemonic_len])
         .expect("GPU mnemonic pipeline failed");
 
@@ -182,16 +182,6 @@ pub(crate) fn assert_mnemonic_pipeline<B: BackendHarness>(ctx: &B) {
     .unwrap();
     let cpu_addr =
         cosmos_vanity_address::pubkey_to_bech32(cpu_key.public_key_bytes(), "cosmos").unwrap();
-
-    let gpu_privkey = &privkeys[..32];
-    assert_eq!(
-        cpu_key.secret_key_bytes(),
-        gpu_privkey,
-        "{} mnemonic pipeline private key mismatch\n  CPU: {}\n  GPU: {}",
-        ctx.label(),
-        hex::encode(cpu_key.secret_key_bytes()),
-        hex::encode(gpu_privkey),
-    );
 
     let mut gpu_addr_bytes = [0u8; 20];
     gpu_addr_bytes.copy_from_slice(&hashes[..20]);
