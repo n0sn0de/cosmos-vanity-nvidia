@@ -995,6 +995,16 @@ impl VanitySearcher {
     pub fn search_gpu_mnemonic(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
         use cosmos_vanity_keyderiv::bip39::Mnemonic;
 
+        let derivation_path = self.config.derivation_path.clone();
+        if derivation_path != cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH {
+            return Err(anyhow::anyhow!(
+                "GPU mnemonic pipeline only supports the default Cosmos derivation path {}; \
+                 use CPU-derived GPU hashing or CPU mode for custom path {}",
+                cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH,
+                derivation_path
+            ));
+        }
+
         let gpu_ctx = ActiveGpuContext::new(self.config.gpu_api)?;
 
         if !gpu_ctx.has_mnemonic_kernel() {
@@ -1175,7 +1185,7 @@ impl VanitySearcher {
                             let result = SearchResult {
                                 address,
                                 mnemonic: batch_strings[i].clone(),
-                                derivation_path: "m/44'/118'/0'/0/0".to_string(),
+                                derivation_path: derivation_path.clone(),
                                 candidate_number: candidate_num,
                                 elapsed_secs: elapsed,
                                 private_key_hex: None,
@@ -1302,6 +1312,33 @@ mod tests {
         assert_eq!(format!("{}", SearchMode::Gpu), "gpu");
         assert_eq!(format!("{}", SearchMode::Hybrid), "hybrid");
         assert_eq!(format!("{}", SearchMode::Cpu), "cpu");
+    }
+
+    #[cfg(any(feature = "opencl", feature = "cuda"))]
+    #[test]
+    fn test_gpu_mnemonic_rejects_custom_derivation_path_before_gpu_init() {
+        let config = SearchConfig {
+            pattern: VanityPattern::Prefix("q".to_string()),
+            hrp: "cosmos".to_string(),
+            derivation_path: "m/44'/118'/0'/0/1".to_string(),
+            num_threads: 1,
+            mode: SearchMode::Gpu,
+            key_mode: KeyMode::Mnemonic,
+            gpu_api: GpuApi::Auto,
+            mnemonic_words: 12,
+            max_matches: 1,
+            checkpoint_interval: 1000,
+            state_file: None,
+        };
+
+        let mut searcher = VanitySearcher::new(config).unwrap();
+        let err = match searcher.search_gpu_mnemonic() {
+            Ok(_) => panic!("custom derivation path unexpectedly reached GPU mnemonic search"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("only supports the default Cosmos derivation path"));
+        assert!(message.contains("m/44'/118'/0'/0/1"));
     }
 
     #[test]
