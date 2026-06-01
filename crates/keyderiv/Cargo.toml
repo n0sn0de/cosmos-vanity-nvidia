@@ -1,0 +1,19 @@
+[package]
+name = "cosmos-vanity-keyderiv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BIP-39 mnemonic generation, BIP-32/44 HD key derivation for Cosmos"
+
+[dependencies]
+bip39 = { workspace = true }
+bitcoin = { workspace = true }
+secp256k1 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
